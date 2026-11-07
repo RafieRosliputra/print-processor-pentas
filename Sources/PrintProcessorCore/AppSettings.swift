@@ -39,6 +39,10 @@ public struct AppSettings: Codable, Equatable {
     public var photoshopPath: String
     /// Absolute path to the cwebp binary; empty = resolve from known locations.
     public var cwebpPath: String
+    /// RAM cache cap for previews, in megabytes (LRU eviction once exceeded).
+    public var cacheRAMCapMB: Int
+    /// Project JSON autosave interval in seconds.
+    public var autosaveSeconds: Int
 
     public static let defaults = AppSettings(
         doubleTapMs: 300,
@@ -52,7 +56,9 @@ public struct AppSettings: Codable, Equatable {
         psdTextLayerName: "TEXT",
         minTextScale: 0.4,
         photoshopPath: "",
-        cwebpPath: ""
+        cwebpPath: "",
+        cacheRAMCapMB: 1536,
+        autosaveSeconds: 3
     )
 
     public init(
@@ -67,7 +73,9 @@ public struct AppSettings: Codable, Equatable {
         psdTextLayerName: String = "TEXT",
         minTextScale: Double = 0.4,
         photoshopPath: String = "",
-        cwebpPath: String = ""
+        cwebpPath: String = "",
+        cacheRAMCapMB: Int = 1536,
+        autosaveSeconds: Int = 3
     ) {
         self.doubleTapMs = doubleTapMs
         self.rotateStep = rotateStep
@@ -81,6 +89,53 @@ public struct AppSettings: Codable, Equatable {
         self.minTextScale = minTextScale
         self.photoshopPath = photoshopPath
         self.cwebpPath = cwebpPath
+        self.cacheRAMCapMB = max(1, cacheRAMCapMB)
+        self.autosaveSeconds = max(1, autosaveSeconds)
+    }
+
+    // MARK: - Codable (backward-compatible: new keys are optional on decode)
+
+    private enum CodingKeys: String, CodingKey {
+        case doubleTapMs, rotateStep, scrollZoomSpeed, scrollRotateSpeed
+        case nudgeBasis, tooltipDelay, scanMode, savedScanModes
+        case psdTextLayerName, minTextScale, photoshopPath, cwebpPath
+        case cacheRAMCapMB, autosaveSeconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        doubleTapMs = try c.decodeIfPresent(Int.self, forKey: .doubleTapMs) ?? 300
+        rotateStep = try c.decodeIfPresent(Double.self, forKey: .rotateStep) ?? 0.1
+        scrollZoomSpeed = try c.decodeIfPresent(Double.self, forKey: .scrollZoomSpeed) ?? 1.0
+        scrollRotateSpeed = try c.decodeIfPresent(Double.self, forKey: .scrollRotateSpeed) ?? 1.0
+        nudgeBasis = try c.decodeIfPresent(NudgeBasis.self, forKey: .nudgeBasis) ?? .export
+        tooltipDelay = try c.decodeIfPresent(Double.self, forKey: .tooltipDelay) ?? 0.5
+        scanMode = try c.decodeIfPresent(String.self, forKey: .scanMode) ?? "text=right"
+        savedScanModes = try c.decodeIfPresent([String].self, forKey: .savedScanModes) ?? ["text=right", "text=left,watermark=right"]
+        psdTextLayerName = try c.decodeIfPresent(String.self, forKey: .psdTextLayerName) ?? "TEXT"
+        minTextScale = try c.decodeIfPresent(Double.self, forKey: .minTextScale) ?? 0.4
+        photoshopPath = try c.decodeIfPresent(String.self, forKey: .photoshopPath) ?? ""
+        cwebpPath = try c.decodeIfPresent(String.self, forKey: .cwebpPath) ?? ""
+        cacheRAMCapMB = try c.decodeIfPresent(Int.self, forKey: .cacheRAMCapMB) ?? 1536
+        autosaveSeconds = try c.decodeIfPresent(Int.self, forKey: .autosaveSeconds) ?? 3
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(doubleTapMs, forKey: .doubleTapMs)
+        try c.encode(rotateStep, forKey: .rotateStep)
+        try c.encode(scrollZoomSpeed, forKey: .scrollZoomSpeed)
+        try c.encode(scrollRotateSpeed, forKey: .scrollRotateSpeed)
+        try c.encode(nudgeBasis, forKey: .nudgeBasis)
+        try c.encode(tooltipDelay, forKey: .tooltipDelay)
+        try c.encode(scanMode, forKey: .scanMode)
+        try c.encode(savedScanModes, forKey: .savedScanModes)
+        try c.encode(psdTextLayerName, forKey: .psdTextLayerName)
+        try c.encode(minTextScale, forKey: .minTextScale)
+        try c.encode(photoshopPath, forKey: .photoshopPath)
+        try c.encode(cwebpPath, forKey: .cwebpPath)
+        try c.encode(cacheRAMCapMB, forKey: .cacheRAMCapMB)
+        try c.encode(autosaveSeconds, forKey: .autosaveSeconds)
     }
 
     private static let storageKey = "com.johorstudio.printprocessor.AppSettings"

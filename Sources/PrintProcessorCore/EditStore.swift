@@ -86,6 +86,32 @@ public struct EditStore: Equatable {
         guard let dict = storage[sizeKey] else { return [] }
         return Array(dict.keys)
     }
+
+    /// Apply the same *absolute* edit to a set of files (global edit).
+    /// - `.all` overwrites every file in `files` with `edit`.
+    /// - `.after` overwrites only the files after `currentIndex`.
+    /// - `.none` does nothing (the caller already wrote the current image).
+    public mutating func applyGlobalEdit(
+        _ edit: ImageEdit,
+        scope: GlobalEditScope,
+        sizeKey: SizeKey,
+        files: [FileName],
+        currentIndex: Int
+    ) {
+        switch scope {
+        case .none:
+            break
+        case .all:
+            for f in files {
+                storage[sizeKey, default: [:]][f] = edit
+            }
+        case .after:
+            guard files.indices.contains(currentIndex) else { return }
+            for f in files.dropFirst(currentIndex + 1) {
+                storage[sizeKey, default: [:]][f] = edit
+            }
+        }
+    }
 }
 
 // MARK: - Codable (backward-compatible with projects that only stored layer-4 edits)

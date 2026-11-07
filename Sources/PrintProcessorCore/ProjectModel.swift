@@ -59,6 +59,31 @@ public struct ProjectModel: Equatable {
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(ProjectModel.self, from: data)
     }
+
+    /// Load a project, recovering from a corrupt JSON: the corrupt file is kept
+    /// as `<name>.bak`, the bad file is removed, and `nil` is returned so the
+    /// caller can start fresh. Returns `nil` for a missing file without touching
+    /// the folder.
+    public static func loadRecovering(from folder: String) -> ProjectModel? {
+        let url = URL(fileURLWithPath: folder).appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        do {
+            return try load(from: folder)
+        } catch {
+            let backup = url.appendingPathExtension("bak")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: url, to: backup)
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+    }
+
+    /// Whether the last `loadRecovering` attempt found (and backed up) a corrupt
+    /// project JSON in this folder.
+    public static func hasRecoveryBackup(in folder: String) -> Bool {
+        let url = URL(fileURLWithPath: folder).appendingPathComponent(fileName).appendingPathExtension("bak")
+        return FileManager.default.fileExists(atPath: url.path)
+    }
 }
 
 // MARK: - Codable (backward-compatible)

@@ -26,9 +26,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var files: [URL] = []
     private var currentIndex = 0
     private var edits = EditStore()
-    private var undoStack = UndoStack<ImageEdit>(maxCount: 50)
+    private var undoStacks: [String: UndoStack<ImageEdit>] = [:]
     private var workingFolder: URL?
     private var settings = AppSettings.load()
+    private let imageCache: ImageCache
 
     // Layer settings + compositing.
     private var layerSettings = LayerSettings.defaults
@@ -108,6 +109,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     override init(frame frameRect: NSRect) {
         self.statusLabel = makeLabel("Select a paper size to begin.", size: 12, weight: .regular, color: .dimText)
+        self.imageCache = ImageCache(ramCapBytes: AppSettings.load().cacheRAMCapMB * 1024 * 1024)
         super.init(frame: frameRect)
         build()
         canvasView.settings = settings
@@ -117,6 +119,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
             forName: .appSettingsDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.applyLiveSettings()
             }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appWillResign), name: NSApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appWillTerminate), name: NSApplication.willTerminateNotification, object: nil)
         restoreLastProject()
         if selectedSize == nil,
            let raw = UserDefaults.standard.string(forKey: Self.lastSizeKey),
@@ -135,6 +141,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         if let observer = settingsObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Layout
@@ -239,8 +246,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
         canvasView.translatesAutoresizingMaskIntoConstraints = false
         canvasView.settings = settings
-        canvasView.onEdit = { [weak self] edit, commit in
-            self?.handleEdit(edit, commit: commit)
+        canvasView.onEdit = { [weak self] edit, commit, scope in
+            self?.handleEdit(edit, commit: commit, scope: scope)
         }
         canvasView.onGestureBegan = { [weak self] in
             self?.handleGestureBegan()
@@ -1209,18 +1216,32 @@ final class ProductionView: NSView, NSTextViewDelegate {
     // MARK: - Size / orientation
 
     private func selectSize(_ size: PaperSize) {
+        if let old = selectedSize, old != size, !files.isEmpty {
+            scaleEdits(from: old, to: size)
+        }
         selectedSize = size
         UserDefaults.standard.set(size.rawValue, forKey: Self.lastSizeKey)
-        for (key, button) in sizeButtons {
-            let selected = (key == size)
-            button.state = selected ? .on : .off
-            button.bezelColor = selected ? .glow : nil
-            button.contentTintColor = selected ? .black : .labelColor
-        }
+        syncSizeButtons()
         applyOrientationToCanvas()
         updateStatus()
         scheduleRenderPreview()
         scheduleAutosave()
+    }
+
+    /// When switching paper size, carry over an image's existing edit from the
+    /// old size to the new size (proportionally) only when the new size has no
+    /// stored edit for that image yet — no reset to Fit.
+    private func scaleEdits(from old: PaperSize, to new: PaperSize) {
+        let oldCanvas = canvasPixelSize(for: old, orientation: orientation)
+        let newCanvas = canvasPixelSize(for: new, orientation: orientation)
+        guard oldCanvas.width > 0, newCanvas.width > 0 else { return }
+        for url in files {
+            let name = url.lastPathComponent
+            guard edits.edit(sizeKey: new.rawValue, fileName: name) == nil,
+                  let existing = edits.edit(sizeKey: old.rawValue, fileName: name) else { continue }
+            edits.setEdit(existing.scaled(fromCanvas: oldCanvas, toCanvas: newCanvas),
+                          sizeKey: new.rawValue, fileName: name)
+        }
     }
 
     private func applyOrientationToCanvas() {
@@ -1265,7 +1286,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
         workingFolder = folder
         UserDefaults.standard.set(folder.path, forKey: Self.lastFolderKey)
 
-        if let existing = try? ProjectModel.load(from: folder.path),
+        let corrupt = ProjectModel.hasRecoveryBackup(in: folder.path)
+        if let existing = ProjectModel.loadRecovering(from: folder.path),
            existing.workingFolder == folder.path {
             edits = existing.edits
             layerSettings = existing.layerSettings
@@ -1280,14 +1302,19 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
         files = collected
         currentIndex = 0
-        undoStack.removeAll()
+        undoStacks.removeAll()
         lastEdit = nil
         gestureBaseline = nil
+
+        imageCache.prime(files: files)
 
         applyAutoOrientation(firstPhotoURL: collected[0])
         applyLayerSettingsToUI()
         showCurrentImage()
         updateStatus()
+        if corrupt {
+            showRecoveryMessage()
+        }
         scheduleAutosave()
     }
 
@@ -1315,9 +1342,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private func goTo(index: Int) {
         guard !files.isEmpty else { return }
         currentIndex = max(0, min(files.count - 1, index))
-        undoStack.removeAll()
         lastEdit = nil
         gestureBaseline = nil
+        imageCache.prefetch(urls: files, around: currentIndex)
         showCurrentImage()
         scheduleAutosave()
     }
@@ -1350,9 +1377,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
         decodeGeneration += 1
         let gen = decodeGeneration
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let image = PhotoImport.decodePreview(url: url, maxDimension: 2048)
+            guard let self = self else { return }
+            let image = self.imageCache.preview(url: url)
             DispatchQueue.main.async {
-                guard let self = self, gen == self.decodeGeneration else { return }
+                guard gen == self.decodeGeneration else { return }
                 self.photoPreview = image
                 self.renderPreview()
             }
@@ -1363,6 +1391,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func canvasPixelSize() -> CGSize {
         guard let size = selectedSize else { return .zero }
+        return canvasPixelSize(for: size, orientation: orientation)
+    }
+
+    private func canvasPixelSize(for size: PaperSize, orientation: CanvasOrientation) -> CGSize {
         if orientation == .portrait {
             return CGSize(width: size.pixelWidth, height: size.pixelHeight)
         }
@@ -1480,23 +1512,53 @@ final class ProductionView: NSView, NSTextViewDelegate {
         gestureBaseline = lastEdit ?? edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
     }
 
-    private func handleEdit(_ newEdit: ImageEdit, commit: Bool) {
+    private func handleEdit(_ newEdit: ImageEdit, commit: Bool, scope: GlobalEditScope) {
         guard let key = currentKey() else { return }
-        let old = lastEdit ?? edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
-        edits.setEdit(newEdit, sizeKey: key.sizeKey, fileName: key.fileName)
+        let fileName = key.fileName
+        let old = lastEdit ?? edits.edit(sizeKey: key.sizeKey, fileName: fileName) ?? .identity
+        edits.setEdit(newEdit, sizeKey: key.sizeKey, fileName: fileName)
         lastEdit = newEdit
+
         if commit {
-            undoStack.push(gestureBaseline ?? old)
+            // The current image is always one undoable step.
+            pushUndo(fileName: fileName, value: gestureBaseline ?? old)
+            if scope != .none {
+                let names = files.map { $0.lastPathComponent }
+                for target in globalTargets(scope: scope, fileNames: names) where target != fileName {
+                    let prior = edits.edit(sizeKey: key.sizeKey, fileName: target) ?? .identity
+                    pushUndo(fileName: target, value: prior)
+                }
+                edits.applyGlobalEdit(newEdit, scope: scope, sizeKey: key.sizeKey,
+                                      files: names, currentIndex: currentIndex)
+            }
             gestureBaseline = nil
         }
         scheduleRenderPreview()
         scheduleAutosave()
     }
 
+    private func globalTargets(scope: GlobalEditScope, fileNames: [String]) -> [String] {
+        switch scope {
+        case .none: return []
+        case .all: return fileNames
+        case .after:
+            guard fileNames.indices.contains(currentIndex) else { return [] }
+            return Array(fileNames.dropFirst(currentIndex + 1))
+        }
+    }
+
+    private func pushUndo(fileName: String, value: ImageEdit) {
+        var stack = undoStacks[fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
+        stack.push(value)
+        undoStacks[fileName] = stack
+    }
+
     private func undo() {
         guard let key = currentKey() else { return }
+        var stack = undoStacks[key.fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
         let current = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
-        guard let previous = undoStack.undo(current: current) else { return }
+        guard let previous = stack.undo(current: current) else { return }
+        undoStacks[key.fileName] = stack
         edits.setEdit(previous, sizeKey: key.sizeKey, fileName: key.fileName)
         lastEdit = previous
         canvasView.edit = previous
@@ -1506,8 +1568,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func redo() {
         guard let key = currentKey() else { return }
+        var stack = undoStacks[key.fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
         let current = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
-        guard let next = undoStack.redo(current: current) else { return }
+        guard let next = stack.redo(current: current) else { return }
+        undoStacks[key.fileName] = stack
         edits.setEdit(next, sizeKey: key.sizeKey, fileName: key.fileName)
         lastEdit = next
         canvasView.edit = next
@@ -1532,6 +1596,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         settings = AppSettings.load()
         canvasView.settings = settings
         compositor.scanMode = settings.scanMode
+        imageCache.setRAMCap(bytes: settings.cacheRAMCapMB * 1024 * 1024)
         refreshRotationField()
         reloadScanModes()
         scheduleLayer2Render()
@@ -1578,46 +1643,100 @@ final class ProductionView: NSView, NSTextViewDelegate {
         autosaveWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.autosave() }
         autosaveWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
+        let seconds = max(1, settings.autosaveSeconds)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seconds * 1000), execute: item)
+    }
+
+    @objc private func appWillResign() {
+        autosaveWorkItem?.cancel()
+        autosave()
+    }
+
+    @objc private func appWillTerminate() {
+        autosaveWorkItem?.cancel()
+        autosave()
+    }
+
+    /// Decode the ORIGINAL file at full quality off the main thread. Export must
+    /// use this (never a cached preview).
+    private func loadOriginal(_ url: URL, completion: @escaping (CGImage?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [imageCache] in
+            let image = imageCache.loadOriginal(url: url)
+            DispatchQueue.main.async { completion(image) }
+        }
     }
 
     private func restoreLastProject() {
         guard let folderPath = UserDefaults.standard.string(forKey: Self.lastFolderKey) else { return }
-        guard let model = try? ProjectModel.load(from: folderPath) else { return }
-
         let folder = URL(fileURLWithPath: folderPath)
-        var urls: [URL] = []
-        for name in model.files {
-            let url = folder.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: url.path) { urls.append(url) }
-        }
-        guard !urls.isEmpty else { return }
+        guard FileManager.default.fileExists(atPath: folder.path) else { return }
 
-        workingFolder = folder
-        files = urls
-        currentIndex = min(max(0, model.currentIndex), files.count - 1)
-        edits = model.edits
-        layerSettings = model.layerSettings
-        psdTextList = model.psdTextList
-        overlayCounter = model.overlayCounter
-        selectedSize = model.selectedSize
+        let model = ProjectModel.loadRecovering(from: folderPath)
+        let corrupt = ProjectModel.hasRecoveryBackup(in: folderPath)
 
-        if let size = selectedSize {
-            for (key, button) in sizeButtons {
-                let selected = (key == size)
-                button.state = selected ? .on : .off
-                button.bezelColor = selected ? .glow : nil
-                button.contentTintColor = selected ? .black : .labelColor
+        if let model = model {
+            var urls: [URL] = []
+            for name in model.files {
+                let url = folder.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: url.path) { urls.append(url) }
             }
-            applyOrientationToCanvas()
-        } else {
-            applyOrientationToCanvas()
+            if !urls.isEmpty {
+                workingFolder = folder
+                files = urls
+                currentIndex = min(max(0, model.currentIndex), files.count - 1)
+                edits = model.edits
+                layerSettings = model.layerSettings
+                psdTextList = model.psdTextList
+                overlayCounter = model.overlayCounter
+                selectedSize = model.selectedSize
+                syncSizeButtons()
+                applyOrientationToCanvas()
+                imageCache.prime(files: files)
+                applyAutoOrientation(firstPhotoURL: urls[0])
+                applyLayerSettingsToUI()
+                showCurrentImage()
+                updateStatus()
+                return
+            }
         }
 
-        applyAutoOrientation(firstPhotoURL: urls[0])
+        // Missing model, corrupt JSON, or files that no longer exist: start fresh
+        // from the folder's photos.
+        let scanned = PhotoImport.naturalSorted(PhotoImport.collectFiles(from: [folder]))
+        guard !scanned.isEmpty else {
+            if corrupt { showRecoveryMessage() }
+            return
+        }
+        workingFolder = folder
+        files = scanned
+        currentIndex = 0
+        edits = EditStore()
+        layerSettings = .defaults
+        psdTextList = [:]
+        overlayCounter = -1
+        selectedSize = nil
+        syncSizeButtons()
+        applyOrientationToCanvas()
+        imageCache.prime(files: files)
+        applyAutoOrientation(firstPhotoURL: scanned[0])
         applyLayerSettingsToUI()
         showCurrentImage()
         updateStatus()
+        if corrupt { showRecoveryMessage() }
+    }
+
+    private func syncSizeButtons() {
+        for (key, button) in sizeButtons {
+            let selected = (key == selectedSize)
+            button.state = selected ? .on : .off
+            button.bezelColor = selected ? .glow : nil
+            button.contentTintColor = selected ? .black : .labelColor
+        }
+    }
+
+    private func showRecoveryMessage() {
+        statusLabel.textColor = .systemRed
+        statusLabel.stringValue = "Project file was corrupt — started fresh (backup saved as .bak)."
     }
 
     // MARK: - Formatting helpers

@@ -9,9 +9,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
+        // Reclaim temp cache directories left behind by crashed runs.
+        ImageCache.removeStaleDiskCaches()
         buildMenu()
         buildWindow()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Clear the per-process temp cache on a normal quit.
+        ImageCache.removeAllDiskCaches()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

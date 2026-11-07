@@ -14,6 +14,8 @@ final class SettingsView: NSView {
     private let minTextScaleField = SettingsView.makeNumberField()
     private let photoshopPathField = SettingsView.makeTextField()
     private let cwebpPathField = SettingsView.makeTextField()
+    private let cacheRAMField = SettingsView.makeNumberField()
+    private let autosaveField = SettingsView.makeNumberField()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -76,6 +78,8 @@ final class SettingsView: NSView {
             ("Min text scale", minTextScaleField, "Min text scale — smallest the layer-2 text may shrink to (fraction)"),
             ("Photoshop path", photoshopPathField, "Photoshop path — absolute path to Photoshop.app (empty = auto-detect)"),
             ("cwebp path", cwebpPathField, "cwebp path — absolute path to cwebp (empty = auto-detect)"),
+            ("Cache RAM cap (MB)", cacheRAMField, "Cache RAM cap — preview LRU cache size in megabytes (default 1536 = 1.5 GB)"),
+            ("Autosave interval (s)", autosaveField, "Autosave interval — project JSON autosave frequency in seconds"),
         ]
 
         let form = NSStackView()
@@ -126,6 +130,8 @@ final class SettingsView: NSView {
         minTextScaleField.stringValue = String(settings.minTextScale)
         photoshopPathField.stringValue = settings.photoshopPath
         cwebpPathField.stringValue = settings.cwebpPath
+        cacheRAMField.stringValue = String(settings.cacheRAMCapMB)
+        autosaveField.stringValue = String(settings.autosaveSeconds)
         if let idx = NudgeBasis.allCases.firstIndex(of: settings.nudgeBasis) {
             nudgePopup.selectItem(at: idx)
         }
@@ -142,6 +148,8 @@ final class SettingsView: NSView {
         let scanMode = scanModeField.stringValue.trimmingCharacters(in: .whitespaces)
         let layerName = textLayerNameField.stringValue.trimmingCharacters(in: .whitespaces)
         let basis = NudgeBasis.allCases[safe: nudgePopup.indexOfSelectedItem] ?? current.nudgeBasis
+        let cacheRAMCap = Int(cacheRAMField.stringValue) ?? current.cacheRAMCapMB
+        let autosaveSeconds = Int(autosaveField.stringValue) ?? current.autosaveSeconds
         return AppSettings(
             doubleTapMs: doubleTap,
             rotateStep: rotateStep,
@@ -154,7 +162,9 @@ final class SettingsView: NSView {
             psdTextLayerName: layerName.isEmpty ? current.psdTextLayerName : layerName,
             minTextScale: minTextScale,
             photoshopPath: photoshopPathField.stringValue.trimmingCharacters(in: .whitespaces),
-            cwebpPath: cwebpPathField.stringValue.trimmingCharacters(in: .whitespaces)
+            cwebpPath: cwebpPathField.stringValue.trimmingCharacters(in: .whitespaces),
+            cacheRAMCapMB: cacheRAMCap,
+            autosaveSeconds: autosaveSeconds
         )
     }
 

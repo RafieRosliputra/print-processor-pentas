@@ -366,6 +366,110 @@ do {
     watcher.stop()
 }
 
+// MARK: - Milestone 4 additions (SPEC §9 cache, global/shift edits, per-size scaling, recovery)
+
+// 6. Per-size scaling: switching size scales offsets proportionally, keeps
+//    scale/rotation (no reset to Fit).
+do {
+    let scaled = ImageEdit(scale: 2, offsetX: 100, offsetY: 200, rotationDeg: 30)
+        .scaled(fromCanvas: CGSize(width: 1200, height: 1800), toCanvas: CGSize(width: 2400, height: 3000))
+    check(scaled.scale == 2 && scaled.rotationDeg == 30,
+          "Per-size scale keeps zoom/rotation (got \(scaled.scale), \(scaled.rotationDeg))")
+    check(isNear(CGFloat(scaled.offsetX), 200) && isNear(CGFloat(scaled.offsetY), 333.33),
+          "Per-size scale offsets proportionally (got \(scaled.offsetX), \(scaled.offsetY))")
+}
+
+// 3. Global absolute edit: .all sets every file; .after only later files.
+do {
+    var store = EditStore()
+    let key = PaperSize.in4x6.rawValue
+    let files = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    store.setEdit(ImageEdit(offsetX: 1), sizeKey: key, fileName: "a.jpg")
+    store.setEdit(ImageEdit(offsetX: 2), sizeKey: key, fileName: "b.jpg")
+
+    let global = ImageEdit(scale: 3, offsetX: 9, offsetY: 8, rotationDeg: 5)
+    store.applyGlobalEdit(global, scope: .all, sizeKey: key, files: files, currentIndex: 1)
+    check(files.allSatisfy { store.edit(sizeKey: key, fileName: $0) == global },
+          "Global .all edit sets every image equal to current")
+
+    // Shift-only applies only to files after the current index (index 1 -> c, d).
+    store.setEdit(ImageEdit(offsetX: 1), sizeKey: key, fileName: "a.jpg")
+    store.setEdit(ImageEdit(offsetX: 2), sizeKey: key, fileName: "b.jpg")
+    store.setEdit(ImageEdit(offsetX: 3), sizeKey: key, fileName: "c.jpg")
+    store.setEdit(ImageEdit(offsetX: 4), sizeKey: key, fileName: "d.jpg")
+    let after = ImageEdit(scale: 7, offsetX: 70, offsetY: 71, rotationDeg: 6)
+    store.applyGlobalEdit(after, scope: .after, sizeKey: key, files: files, currentIndex: 1)
+    check(store.edit(sizeKey: key, fileName: "a.jpg")?.offsetX == 1
+          && store.edit(sizeKey: key, fileName: "b.jpg")?.offsetX == 2,
+          "Shift-only leaves earlier files unchanged")
+    check(store.edit(sizeKey: key, fileName: "c.jpg") == after
+          && store.edit(sizeKey: key, fileName: "d.jpg") == after,
+          "Shift-only applies absolute edit to later files only")
+}
+
+// 5. Corrupt project JSON -> .bak kept, fresh start.
+do {
+    let tmp = makeTempDir("recover")
+    let jsonURL = URL(fileURLWithPath: tmp).appendingPathComponent(ProjectModel.fileName)
+    makeFile(jsonURL.path, Array("{ not valid json".utf8))
+    let recovered = ProjectModel.loadRecovering(from: tmp)
+    check(recovered == nil, "Corrupt project JSON returns nil (fresh start)")
+    let bakURL = jsonURL.appendingPathExtension("bak")
+    check(FileManager.default.fileExists(atPath: bakURL.path),
+          "Corrupt project JSON kept as .bak")
+    check(!FileManager.default.fileExists(atPath: jsonURL.path),
+          "Corrupt project JSON removed after backup")
+}
+
+// 2a. ImageCache LRU respects the RAM cap and evicts least-recently-used.
+do {
+    let tmp = makeTempDir("cache")
+    func writePng(_ w: Int, _ h: Int, _ name: String) -> String {
+        writeTempPNG(makeSolidImage(width: w, height: h, r: 1, g: 0, b: 0, a: 1)!, name: name)
+    }
+    let a = URL(fileURLWithPath: writePng(100, 100, "a.png"))
+    let b = URL(fileURLWithPath: writePng(100, 100, "b.png"))
+    let c = URL(fileURLWithPath: writePng(100, 100, "c.png"))
+    defer {
+        for u in [a, b, c] { try? FileManager.default.removeItem(at: u) }
+        try? FileManager.default.removeItem(atPath: tmp)
+    }
+
+    // Cap holds two 100x100 previews (~40 KB each); a third evicts the LRU (a).
+    let cache = ImageCache(ramCapBytes: 80_000)
+    _ = cache.preview(url: a)
+    _ = cache.preview(url: b)
+    check(cache.isCachedInRAM(a) && cache.isCachedInRAM(b), "ImageCache holds first two previews")
+    _ = cache.preview(url: c)
+    check(cache.ramUsageBytes() <= 80_000, "ImageCache RAM usage respects cap (got \(cache.ramUsageBytes()))")
+    check(!cache.isCachedInRAM(a) && cache.isCachedInRAM(b) && cache.isCachedInRAM(c),
+          "ImageCache evicts least-recently-used (a)")
+
+    // loadOriginal returns the full-resolution original, never a preview.
+    let big = URL(fileURLWithPath: writePng(300, 200, "orig.png"))
+    defer { try? FileManager.default.removeItem(at: big) }
+    let original = cache.loadOriginal(url: big)
+    check(original?.width == 300 && original?.height == 200,
+          "ImageCache.loadOriginal decodes original size (got \(original?.width ?? 0)x\(original?.height ?? 0))")
+}
+
+// 2b. Stale temp cache directories from crashed runs are removed at launch.
+do {
+    let base = URL(fileURLWithPath: makeTempDir("stale"))
+    defer { try? FileManager.default.removeItem(at: base) }
+    let stale = base.appendingPathComponent("PrintProcessorCache-99999")
+    let current = base.appendingPathComponent("PrintProcessorCache-\(ProcessInfo.processInfo.processIdentifier)")
+    let other = base.appendingPathComponent("keepme")
+    try? FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: current, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+
+    ImageCache.removeStaleDiskCaches(in: base)
+    check(!FileManager.default.fileExists(atPath: stale.path), "Stale cache dir removed at launch")
+    check(FileManager.default.fileExists(atPath: current.path), "Current-process cache dir preserved")
+    check(FileManager.default.fileExists(atPath: other.path), "Unrelated dirs untouched")
+}
+
 if failures == 0 {
     print("PrintProcessorCheck: PASS")
     exit(0)

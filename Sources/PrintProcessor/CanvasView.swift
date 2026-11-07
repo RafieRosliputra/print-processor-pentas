@@ -68,7 +68,8 @@ final class CanvasView: NSView {
     // MARK: - Callbacks
 
     /// Layer-4 edit produced by user input (`commit` = discrete/undoable).
-    var onEdit: ((ImageEdit, Bool) -> Void)?
+    /// `scope` reports whether Cmd+Shift / Shift requested a global edit.
+    var onEdit: ((ImageEdit, Bool, GlobalEditScope) -> Void)?
     /// A continuous layer-4 gesture just started — record an undo baseline.
     var onGestureBegan: (() -> Void)?
     var onNextFile: (() -> Void)?
@@ -112,6 +113,7 @@ final class CanvasView: NSView {
     private var preciseRotateAccum: Double = 0
     private var gestureActive = false
     private var gestureEndWorkItem: DispatchWorkItem?
+    private var lastGestureScope: GlobalEditScope = .none
 
     // Layer 1 / 3 free-transform gesture state.
     private enum TransformMode { case move, scale, rotate }
@@ -546,6 +548,7 @@ final class CanvasView: NSView {
 
         // 3. Otherwise: layer-4 pan.
         lastDragPoint = screenPoint
+        lastGestureScope = scope(for: event)
         beginGesture()
     }
 
@@ -582,13 +585,14 @@ final class CanvasView: NSView {
         }
 
         guard !locked, let last = lastDragPoint else { return }
+        lastGestureScope = scope(for: event)
         let dx = Double(screenPoint.x - last.x) / Double(screenScale())
         let dy = Double(screenPoint.y - last.y) / Double(screenScale())
         lastDragPoint = screenPoint
         var e = edit
         e.offsetX += dx
         e.offsetY += dy
-        applyEdit(e, commit: false)
+        applyEdit(e, commit: false, scope: lastGestureScope)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -612,7 +616,7 @@ final class CanvasView: NSView {
             return
         }
         lastDragPoint = nil
-        applyEdit(edit, commit: true)
+        applyEdit(edit, commit: true, scope: lastGestureScope)
     }
 
     // MARK: - Free-transform plumbing
@@ -740,6 +744,7 @@ final class CanvasView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard !locked else { return }
+        lastGestureScope = scope(for: event)
         beginGesture()
         if isRDown {
             applyRotation(with: event)
@@ -759,7 +764,7 @@ final class CanvasView: NSView {
             factor = exp(delta * 0.2 * speed)
         }
         e.scale = min(Self.maxScale, max(Self.minScale, e.scale * factor))
-        applyEdit(e, commit: false)
+        applyEdit(e, commit: false, scope: lastGestureScope)
         scheduleCommit()
     }
 
@@ -773,13 +778,13 @@ final class CanvasView: NSView {
             if whole != 0 {
                 e.rotationDeg += whole * step * speed
                 preciseRotateAccum -= whole * 30.0
-                applyEdit(e, commit: true)
+                applyEdit(e, commit: true, scope: lastGestureScope)
             }
         } else {
             let direction: Double = event.scrollingDeltaY > 0 ? 1 : (event.scrollingDeltaY < 0 ? -1 : 0)
             if direction != 0 {
                 e.rotationDeg += direction * step * speed
-                applyEdit(e, commit: true)
+                applyEdit(e, commit: true, scope: lastGestureScope)
             }
         }
     }
@@ -793,11 +798,12 @@ final class CanvasView: NSView {
         }
         let cmd = event.modifierFlags.contains(.command)
         let shift = event.modifierFlags.contains(.shift)
+        let scope = self.scope(for: event)
         switch event.keyCode {
-        case 123: nudge(dx: shift ? -10 : -1, dy: 0)
-        case 124: nudge(dx: shift ? 10 : 1, dy: 0)
-        case 126: nudge(dx: 0, dy: shift ? 10 : 1)
-        case 125: nudge(dx: 0, dy: shift ? -10 : -1)
+        case 123: nudge(dx: shift ? -10 : -1, dy: 0, scope: scope)
+        case 124: nudge(dx: shift ? 10 : 1, dy: 0, scope: scope)
+        case 126: nudge(dx: 0, dy: shift ? 10 : 1, scope: scope)
+        case 125: nudge(dx: 0, dy: shift ? -10 : -1, scope: scope)
         case 49:
             if !event.isARepeat { handleSpace() }
         case 6:
@@ -816,7 +822,7 @@ final class CanvasView: NSView {
         if event.keyCode == 15 { isRDown = false } else { super.keyUp(with: event) }
     }
 
-    private func nudge(dx: Double, dy: Double) {
+    private func nudge(dx: Double, dy: Double, scope: GlobalEditScope) {
         beginGesture()
         var e = edit
         if settings.nudgeBasis == .screen {
@@ -827,7 +833,7 @@ final class CanvasView: NSView {
             e.offsetX += dx * perPixel
             e.offsetY += dy * perPixel
         }
-        applyEdit(e, commit: true)
+        applyEdit(e, commit: true, scope: scope)
     }
 
     private func pointPerExportPixel() -> Double {
@@ -879,24 +885,34 @@ final class CanvasView: NSView {
 
     // MARK: - Edit plumbing
 
-    private func applyEdit(_ newEdit: ImageEdit, commit: Bool) {
+    private func applyEdit(_ newEdit: ImageEdit, commit: Bool, scope: GlobalEditScope = .none) {
         edit = newEdit
         if commit {
             commitWorkItem?.cancel()
             commitWorkItem = nil
         }
-        onEdit?(newEdit, commit)
+        onEdit?(newEdit, commit, scope)
     }
 
     private func scheduleCommit() {
         commitWorkItem?.cancel()
+        let scope = lastGestureScope
         let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.commitWorkItem = nil
-            self.onEdit?(self.edit, true)
+            self.onEdit?(self.edit, true, scope)
         }
         commitWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    /// Determine the global-edit scope from the current modifier keys:
+    /// Cmd+Shift → all files; Shift alone → files after the current one.
+    private func scope(for event: NSEvent) -> GlobalEditScope {
+        let flags = event.modifierFlags
+        if flags.contains(.command) && flags.contains(.shift) { return .all }
+        if flags.contains(.shift) { return .after }
+        return .none
     }
 }
 

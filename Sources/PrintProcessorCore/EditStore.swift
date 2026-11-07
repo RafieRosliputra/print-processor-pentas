@@ -12,6 +12,8 @@ public struct EditStore: Equatable {
     private var storage: [SizeKey: [FileName: ImageEdit]] = [:]
     private var watermarkStorage: [SizeKey: [FileName: WatermarkTransform]] = [:]
     private var overlayStorage: [SizeKey: [FileName: OverlayTransform]] = [:]
+    private var psdTextStorage: [SizeKey: [FileName: String]] = [:]
+    private var psdBoxStorage: [SizeKey: [FileName: PSDTextBox]] = [:]
 
     public init() {}
 
@@ -47,11 +49,35 @@ public struct EditStore: Equatable {
         overlayStorage[sizeKey, default: [:]][fileName] = transform
     }
 
+    /// Per-image manual layer-2 text override, or nil when unset (use list/scan).
+    public func manualText(sizeKey: SizeKey, fileName: FileName) -> String? {
+        psdTextStorage[sizeKey]?[fileName]
+    }
+
+    public mutating func setManualText(_ text: String, sizeKey: SizeKey, fileName: FileName) {
+        if text.isEmpty {
+            psdTextStorage[sizeKey, default: [:]].removeValue(forKey: fileName)
+        } else {
+            psdTextStorage[sizeKey, default: [:]][fileName] = text
+        }
+    }
+
+    /// Per-image layer-2 bounding-box override, or nil when unset (use global).
+    public func psdBoxOverride(sizeKey: SizeKey, fileName: FileName) -> PSDTextBox? {
+        psdBoxStorage[sizeKey]?[fileName]
+    }
+
+    public mutating func setPSDBoxOverride(_ box: PSDTextBox, sizeKey: SizeKey, fileName: FileName) {
+        psdBoxStorage[sizeKey, default: [:]][fileName] = box
+    }
+
     /// All size keys that currently hold at least one edit.
     public func sizeKeys() -> [SizeKey] {
         var keys = Set(storage.keys)
         keys.formUnion(watermarkStorage.keys)
         keys.formUnion(overlayStorage.keys)
+        keys.formUnion(psdTextStorage.keys)
+        keys.formUnion(psdBoxStorage.keys)
         return Array(keys)
     }
 
@@ -69,6 +95,8 @@ extension EditStore: Codable {
         case storage
         case watermarkStorage
         case overlayStorage
+        case psdTextStorage
+        case psdBoxStorage
     }
 
     public init(from decoder: Decoder) throws {
@@ -76,6 +104,8 @@ extension EditStore: Codable {
         storage = try c.decodeIfPresent([SizeKey: [FileName: ImageEdit]].self, forKey: .storage) ?? [:]
         watermarkStorage = try c.decodeIfPresent([SizeKey: [FileName: WatermarkTransform]].self, forKey: .watermarkStorage) ?? [:]
         overlayStorage = try c.decodeIfPresent([SizeKey: [FileName: OverlayTransform]].self, forKey: .overlayStorage) ?? [:]
+        psdTextStorage = try c.decodeIfPresent([SizeKey: [FileName: String]].self, forKey: .psdTextStorage) ?? [:]
+        psdBoxStorage = try c.decodeIfPresent([SizeKey: [FileName: PSDTextBox]].self, forKey: .psdBoxStorage) ?? [:]
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -83,5 +113,7 @@ extension EditStore: Codable {
         try c.encode(storage, forKey: .storage)
         try c.encode(watermarkStorage, forKey: .watermarkStorage)
         try c.encode(overlayStorage, forKey: .overlayStorage)
+        try c.encode(psdTextStorage, forKey: .psdTextStorage)
+        try c.encode(psdBoxStorage, forKey: .psdBoxStorage)
     }
 }

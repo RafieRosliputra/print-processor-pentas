@@ -268,6 +268,8 @@ public struct LayerSettings: Codable, Equatable {
     public var gradient: GradientSettings
     public var bg5: BackgroundSettings
     public var bg6: FinalBackground
+    /// Layer-2 PSD styled text settings.
+    public var psdText: PSDTextSettings
 
     public init(
         enabled: LayerVisibility = .defaults,
@@ -275,7 +277,8 @@ public struct LayerSettings: Codable, Equatable {
         overlay: OverlaySettings = .defaults,
         gradient: GradientSettings = .defaults,
         bg5: BackgroundSettings = .defaults,
-        bg6: FinalBackground = .defaults
+        bg6: FinalBackground = .defaults,
+        psdText: PSDTextSettings = .defaults
     ) {
         self.enabled = enabled
         self.watermark = watermark
@@ -283,7 +286,36 @@ public struct LayerSettings: Codable, Equatable {
         self.gradient = gradient
         self.bg5 = bg5
         self.bg6 = bg6
+        self.psdText = psdText
     }
 
     public static let defaults = LayerSettings()
+
+    // MARK: Codable (backward-compatible with pre-psdText projects)
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, watermark, overlay, gradient, bg5, bg6, psdText
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(LayerVisibility.self, forKey: .enabled) ?? .defaults
+        watermark = try c.decodeIfPresent(WatermarkSettings.self, forKey: .watermark) ?? .defaults
+        overlay = try c.decodeIfPresent(OverlaySettings.self, forKey: .overlay) ?? .defaults
+        gradient = try c.decodeIfPresent(GradientSettings.self, forKey: .gradient) ?? .defaults
+        bg5 = try c.decodeIfPresent(BackgroundSettings.self, forKey: .bg5) ?? .defaults
+        bg6 = try c.decodeIfPresent(FinalBackground.self, forKey: .bg6) ?? .defaults
+        psdText = try c.decodeIfPresent(PSDTextSettings.self, forKey: .psdText) ?? .defaults
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(watermark, forKey: .watermark)
+        try c.encode(overlay, forKey: .overlay)
+        try c.encode(gradient, forKey: .gradient)
+        try c.encode(bg5, forKey: .bg5)
+        try c.encode(bg6, forKey: .bg6)
+        try c.encode(psdText, forKey: .psdText)
+    }
 }

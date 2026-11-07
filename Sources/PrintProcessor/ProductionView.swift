@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 /// Production tab: canvas on the left, scrollable options panel on the right,
 /// and a top-right bar with paper-size buttons + Process.
-final class ProductionView: NSView {
+final class ProductionView: NSView, NSTextViewDelegate {
     enum CanvasOrientation {
         case portrait
         case landscape
@@ -57,6 +57,26 @@ final class ProductionView: NSView {
     private var bg6ColourWell: NSColorWell?
     private var bg6PathLabel: NSTextField?
 
+    // Layer 2 / 3 (PSD) state.
+    private let photoshopQueue = DispatchQueue(label: "com.johorstudio.printprocessor.photoshop", qos: .userInitiated)
+    private var psdTextRenderer: PSDTextLayerRenderer?
+    private let overlayExporter = PSDOverlayExporter.standard()
+    private var overlayWatcher: FileWatcher?
+    private var photoEditWatcher: FileWatcher?
+    private var psdTextList: [String: String] = [:]
+    private var overlayCounter = -1
+    private var overlayPSDPath = ""
+    private var layer2RenderGeneration = 0
+
+    // Layer-2 / 3 control references.
+    private var psdTextPathLabel: NSTextField?
+    private var psdManualTextField: NSTextField?
+    private var psdListTextView: NSTextView?
+    private var psdScanModePopup: NSPopUpButton?
+    private var psdPreviewLabel: NSTextField?
+    private var psdAlignPopup: NSPopUpButton?
+    private var overlayOpenButton: NSButton?
+
     /// Layer key (1…6, 0 = gradient) → section, for eye syncing.
     private var sections: [Int: SectionView] = [:]
 
@@ -91,6 +111,8 @@ final class ProductionView: NSView {
         super.init(frame: frameRect)
         build()
         canvasView.settings = settings
+        compositor.scanMode = settings.scanMode
+        reloadScanModes()
         settingsObserver = NotificationCenter.default.addObserver(
             forName: .appSettingsDidChange, object: nil, queue: .main) { [weak self] _ in
                 self?.applyLiveSettings()
@@ -237,6 +259,12 @@ final class ProductionView: NSView {
         canvasView.onOverlayChanged = { [weak self] transform, commit, option in
             self?.handleOverlayChange(transform, commit: commit, option: option)
         }
+        canvasView.onPSDTextBoxChanged = { [weak self] box, commit in
+            self?.handlePSDTextBoxChanged(box, commit: commit)
+        }
+        canvasView.onMiddleClick = { [weak self] layer in
+            self?.handleMiddleClick(layer)
+        }
 
         let options = makeOptionsPanel()
 
@@ -270,7 +298,7 @@ final class ProductionView: NSView {
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let watermarkSection = SectionView(title: "Watermark", body: makeWatermarkBody())
-        let psdSection = SectionView(title: "PSD Text", bodyText: "Styled text loaded from a PSD text layer. Placeholder.")
+        let psdSection = SectionView(title: "PSD Text", body: makePSDTextBody())
         let overlaySection = SectionView(title: "Overlay", body: makeOverlayBody())
         let gradientSection = SectionView(title: "Gradient", body: makeGradientBody())
         let photoSection = SectionView(title: "Photo", body: makePhotoSectionBody())
@@ -364,6 +392,91 @@ final class ProductionView: NSView {
         return makeBody(stack)
     }
 
+    private func makePSDTextBody() -> NSView {
+        let loadButton = NSButton(title: "Load PSD…", target: self, action: #selector(loadPSDTextClicked))
+        loadButton.bezelStyle = .rounded
+        loadButton.controlSize = .regular
+        loadButton.toolTip = "Load PSD… — PSD with a text layer + layer style; text is set in Photoshop, style stays identical"
+
+        let pathLabel = makeLabel("No PSD loaded", size: 11, weight: .regular, color: .dimText)
+        psdTextPathLabel = pathLabel
+
+        let drawBoxButton = NSButton(title: "Draw box", target: self, action: #selector(drawPSDBoxClicked))
+        drawBoxButton.bezelStyle = .rounded
+        drawBoxButton.controlSize = .regular
+        drawBoxButton.toolTip = "Draw box — drag on the canvas to set the layer-2 text bounding box"
+
+        let manualField = NSTextField()
+        manualField.placeholderString = "Manual text (overrides list/scan)"
+        manualField.controlSize = .regular
+        manualField.isBezeled = true
+        manualField.target = self
+        manualField.action = #selector(psdManualTextChanged)
+        manualField.toolTip = "Manual text — per-image override, highest priority for layer 2"
+        psdManualTextField = manualField
+
+        let importButton = NSButton(title: "Import .txt", target: self, action: #selector(importPSDListClicked))
+        importButton.bezelStyle = .rounded
+        importButton.controlSize = .regular
+        importButton.toolTip = "Import .txt — number + name list (one per line: 122 - Norman Hakim or 122<TAB>Norman Hakim)"
+
+        let textScroll = NSTextView.scrollableTextView()
+        let textView = textScroll.documentView as? NSTextView
+        textView?.isRichText = false
+        textView?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView?.textContainerInset = NSSize(width: 4, height: 4)
+        textScroll.heightAnchor.constraint(equalToConstant: 64).isActive = true
+        textView?.delegate = self
+        psdListTextView = textView
+
+        let scanPopup = NSPopUpButton()
+        scanPopup.target = self
+        scanPopup.action = #selector(psdScanModeChanged)
+        scanPopup.toolTip = "Scan mode — which side of \" - \" goes to text vs watermark; saved modes switchable in one click"
+        psdScanModePopup = scanPopup
+
+        let alignPopup = NSPopUpButton()
+        for align in TextAlign.allCases { alignPopup.addItem(withTitle: align.displayName) }
+        alignPopup.target = self
+        alignPopup.action = #selector(psdAlignChanged)
+        alignPopup.toolTip = "Align — layer-2 text alignment inside the bounding box"
+        psdAlignPopup = alignPopup
+
+        let previewLabel = makeLabel("", size: 11, weight: .regular, color: .dimText)
+        previewLabel.maximumNumberOfLines = 3
+        previewLabel.lineBreakMode = .byWordWrapping
+        psdPreviewLabel = previewLabel
+
+        let listLabel = makeLabel("List / paste (number → text)", size: 12, weight: .regular, color: .labelColor)
+
+        let stack = NSStackView(views: [
+            loadButton, pathLabel, drawBoxButton,
+            manualField,
+            labelRow("Align", alignPopup),
+            labelRow("Scan", scanPopup),
+            listLabel, textScroll, importButton,
+            previewLabel,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 24, bottom: 10, right: 10)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for v in [textScroll, previewLabel, manualField] { v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -14).isActive = true }
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: stack.bottomAnchor),
+        ])
+        reloadScanModes()
+        return container
+    }
+
     private func makeOverlayBody() -> NSView {
         let loadButton = NSButton(title: "Load overlay…", target: self, action: #selector(loadOverlayClicked))
         loadButton.bezelStyle = .rounded
@@ -373,7 +486,19 @@ final class ProductionView: NSView {
         let label = makeLabel("No overlay loaded", size: 11, weight: .regular, color: .dimText)
         overlayPathLabel = label
 
-        let stack = NSStackView(views: [loadButton, label])
+        let loadPSDButton = NSButton(title: "Load PSD…", target: self, action: #selector(loadOverlayPSDClicked))
+        loadPSDButton.bezelStyle = .rounded
+        loadPSDButton.controlSize = .regular
+        loadPSDButton.toolTip = "Load PSD… — layer-3 PSD overlay; exports <name>-NN.webp beside it and watches for saves"
+
+        let openButton = NSButton(title: "Open in Photoshop", target: self, action: #selector(openOverlayInPhotoshop))
+        openButton.bezelStyle = .rounded
+        openButton.controlSize = .regular
+        openButton.isEnabled = false
+        openButton.toolTip = "Open in Photoshop — open the layer-3 overlay file"
+        overlayOpenButton = openButton
+
+        let stack = NSStackView(views: [loadButton, loadPSDButton, openButton, label])
         return makeBody(stack)
     }
 
@@ -575,6 +700,12 @@ final class ProductionView: NSView {
         watermarkOpacityValue?.stringValue = formatPercent(layerSettings.watermark.opacity)
         gradientAngleValue?.stringValue = formatDegrees(layerSettings.gradient.angle)
         gradientOpacityValue?.stringValue = formatPercent(layerSettings.gradient.opacity)
+        psdTextPathLabel?.stringValue = pathSummary(layerSettings.psdText.path, empty: "No PSD loaded")
+        if let idx = TextAlign.allCases.firstIndex(of: layerSettings.psdText.align) {
+            psdAlignPopup?.selectItem(at: idx)
+        }
+        canvasView.psdTextBox = layerSettings.psdText.box
+        canvasView.psdTextAlign = layerSettings.psdText.align
     }
 
     // MARK: - Actions (layers)
@@ -709,6 +840,326 @@ final class ProductionView: NSView {
         }
     }
 
+    // MARK: - Layer 2 (PSD text)
+
+    @objc private func loadPSDTextClicked() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        if let psdType = UTType(filenameExtension: "psd") { panel.allowedContentTypes = [psdType] }
+        panel.message = "Choose a PSD with a text layer + layer style."
+        panel.prompt = "Load"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setPSDTextPath(url.path)
+    }
+
+    private func setPSDTextPath(_ path: String) {
+        layerSettings.psdText.path = path
+        psdTextPathLabel?.stringValue = URL(fileURLWithPath: path).lastPathComponent
+        canvasView.psdTextBox = layerSettings.psdText.box
+        canvasView.psdTextAlign = layerSettings.psdText.align
+        scheduleLayer2Render()
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func drawPSDBoxClicked() {
+        canvasView.armPSDBoxDrawing()
+    }
+
+    @objc private func psdManualTextChanged() {
+        guard let key = currentKey() else { return }
+        let text = psdManualTextField?.stringValue ?? ""
+        edits.setManualText(text, sizeKey: key.sizeKey, fileName: key.fileName)
+        scheduleLayer2Render()
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func psdScanModeChanged() {
+        guard let popup = psdScanModePopup else { return }
+        let modes = currentScanModes()
+        let idx = popup.indexOfSelectedItem
+        guard modes.indices.contains(idx) else { return }
+        var s = AppSettings.load()
+        s.scanMode = modes[idx]
+        s.save()
+        settings = s
+        compositor.scanMode = s.scanMode
+        updatePSDPreview()
+        scheduleLayer2Render()
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func psdAlignChanged() {
+        guard let popup = psdAlignPopup else { return }
+        let idx = popup.indexOfSelectedItem
+        guard TextAlign.allCases.indices.contains(idx) else { return }
+        layerSettings.psdText.align = TextAlign.allCases[idx]
+        canvasView.psdTextAlign = layerSettings.psdText.align
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func importPSDListClicked() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        if let txtType = UTType(filenameExtension: "txt") { panel.allowedContentTypes = [txtType] }
+        panel.prompt = "Import"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        psdListTextView?.string = text
+        applyPSDList(text)
+    }
+
+    private func applyPSDList(_ text: String) {
+        psdTextList = TextSourceResolver.parseList(text)
+        updatePSDPreview()
+        scheduleLayer2Render()
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        applyPSDList(psdListTextView?.string ?? "")
+    }
+
+    private func reloadScanModes() {
+        guard let popup = psdScanModePopup else { return }
+        popup.removeAllItems()
+        for mode in currentScanModes() {
+            popup.addItem(withTitle: ScanMode.parse(mode).displayName)
+        }
+        if let idx = currentScanModes().firstIndex(of: settings.scanMode) {
+            popup.selectItem(at: idx)
+        }
+        updatePSDPreview()
+    }
+
+    private func currentScanModes() -> [String] {
+        settings.savedScanModes.isEmpty ? ["text=right"] : settings.savedScanModes
+    }
+
+    private func updatePSDPreview() {
+        let mode = ScanMode.parse(settings.scanMode)
+        var lines: [String] = []
+        for file in files.prefix(3) {
+            let r = TextSourceResolver.resolve(fileName: file.lastPathComponent, manualText: "", list: psdTextList, scanMode: mode)
+            lines.append("\(file.lastPathComponent) → “\(r.text)” / wm “\(r.watermark)”")
+        }
+        psdPreviewLabel?.stringValue = lines.isEmpty ? "No files — scan preview appears here." : lines.joined(separator: "\n")
+    }
+
+    private func handlePSDTextBoxChanged(_ box: PSDTextBox, commit: Bool) {
+        layerSettings.psdText.box = box
+        canvasView.psdTextBox = box
+        scheduleRenderPreview()
+        if commit { scheduleAutosave() }
+    }
+
+    private func runnerForRender() -> PhotoshopRunnerProtocol {
+        PhotoshopRunner(photoshopAppPath: settings.photoshopPath)
+    }
+
+    private func cacheDirectory() -> String {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("PrintProcessor/psdtext-cache")
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base.path
+    }
+
+    private func layer2BoxPixelWidth() -> CGFloat {
+        let canvas = canvasPixelSize()
+        guard canvas.width > 0 else { return 1000 }
+        return CGFloat(layerSettings.psdText.box.width) * canvas.width
+    }
+
+    private func scheduleLayer2Render() {
+        guard !layerSettings.psdText.path.isEmpty else {
+            compositor.layer2Image = nil
+            return
+        }
+        layer2RenderGeneration += 1
+        let gen = layer2RenderGeneration
+        let psdPath = layerSettings.psdText.path
+        let layerName = settings.psdTextLayerName.isEmpty ? "TEXT" : settings.psdTextLayerName
+        let cacheDir = cacheDirectory()
+        let boxWidth = layer2BoxPixelWidth()
+        let fileName = currentFileName()
+        let sizeKey = currentSizeKey()
+        let manualText = edits.manualText(sizeKey: sizeKey, fileName: fileName) ?? ""
+        let list = psdTextList
+        let mode = ScanMode.parse(settings.scanMode)
+        let minScale = settings.minTextScale
+        let text = TextSourceResolver.resolve(fileName: fileName, manualText: manualText, list: list, scanMode: mode).text
+        let photoshopPath = settings.photoshopPath
+
+        let renderer = PSDTextLayerRenderer(
+            runner: PhotoshopRunner(photoshopAppPath: photoshopPath),
+            cacheDirectory: cacheDir,
+            layerName: layerName,
+            minTextScale: minScale
+        )
+        psdTextRenderer = renderer
+
+        photoshopQueue.async { [weak self] in
+            let image = renderer.render(psdPath: psdPath, text: text, boxWidth: boxWidth)
+            DispatchQueue.main.async {
+                guard let self = self, gen == self.layer2RenderGeneration else { return }
+                self.compositor.layer2Image = image
+                self.renderPreview()
+            }
+        }
+    }
+
+    // MARK: - Layer 3 (PSD overlay)
+
+    @objc private func loadOverlayPSDClicked() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        if let psdType = UTType(filenameExtension: "psd") { panel.allowedContentTypes = [psdType] }
+        panel.message = "Choose a PSD overlay."
+        panel.prompt = "Load"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setOverlayPSD(url)
+    }
+
+    private func setOverlayPSD(_ url: URL) {
+        overlayPSDPath = url.path
+        overlayOpenButton?.isEnabled = true
+        if !WebPEncoder.isAvailable {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "cwebp not found — install webp or set cwebpPath."
+        }
+        let counter = overlayCounter
+        photoshopQueue.async { [weak self] in
+            guard let self = self else { return }
+            if let out = self.overlayExporter.export(psdURL: url, counter: counter) {
+                let maxNum = WebPNumbering.existingNumbers(psdURL: url).max() ?? counter
+                DispatchQueue.main.async {
+                    self.overlayCounter = max(maxNum, counter)
+                    self.layerSettings.overlay.path = out.path
+                    self.compositor.invalidateCache()
+                    self.overlayPathLabel?.stringValue = out.lastPathComponent
+                    self.scheduleRenderPreview()
+                    self.scheduleAutosave()
+                    self.startOverlayWatcher(url)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.statusLabel.textColor = .systemRed
+                    self.statusLabel.stringValue = "Could not flatten PSD overlay."
+                }
+            }
+        }
+    }
+
+    private func startOverlayWatcher(_ url: URL) {
+        overlayWatcher?.stop()
+        overlayWatcher = FileWatcher(path: url.path, debounce: 2.0) { [weak self] path in
+            guard let self = self else { return }
+            let psdURL = URL(fileURLWithPath: path)
+            DispatchQueue.main.async {
+                let counter = self.overlayCounter
+                self.photoshopQueue.async {
+                    if let out = self.overlayExporter.export(psdURL: psdURL, counter: counter) {
+                        let maxNum = WebPNumbering.existingNumbers(psdURL: psdURL).max() ?? counter
+                        DispatchQueue.main.async {
+                            self.overlayCounter = max(maxNum, counter)
+                            self.layerSettings.overlay.path = out.path
+                            self.compositor.invalidateCache()
+                            self.overlayPathLabel?.stringValue = out.lastPathComponent
+                            self.scheduleRenderPreview()
+                            self.scheduleAutosave()
+                        }
+                    }
+                }
+            }
+        }
+        overlayWatcher?.start()
+    }
+
+    @objc private func openOverlayInPhotoshop() {
+        let path = overlayPSDPath.isEmpty ? layerSettings.overlay.path : overlayPSDPath
+        guard !path.isEmpty else { return }
+        openInPhotoshop(path)
+    }
+
+    // MARK: - Middle-click / open in Photoshop
+
+    private func handleMiddleClick(_ layer: Int) {
+        switch layer {
+        case 2:
+            guard !layerSettings.psdText.path.isEmpty else { return }
+            openInPhotoshop(layerSettings.psdText.path)
+        case 3:
+            openOverlayInPhotoshop()
+        case 4:
+            if let url = currentFileURL() { openPhotoInPhotoshop(url) }
+        default:
+            break
+        }
+    }
+
+    private func openInPhotoshop(_ path: String) {
+        let fileURL = URL(fileURLWithPath: path)
+        let appPath = settings.photoshopPath.isEmpty ? (PhotoshopRunner.detectPhotoshop() ?? "") : settings.photoshopPath
+        if !appPath.isEmpty {
+            NSWorkspace.shared.open([fileURL], withApplicationAt: URL(fileURLWithPath: appPath),
+                                    configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        } else {
+            NSWorkspace.shared.open(fileURL)
+        }
+    }
+
+    private func openPhotoInPhotoshop(_ url: URL) {
+        let backupURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pp-orig-\(UUID().uuidString).\(url.pathExtension)")
+        let hadOriginal = (try? FileManager.default.copyItem(at: url, to: backupURL)) != nil
+        let before = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        openInPhotoshop(url.path)
+        photoEditWatcher?.stop()
+        photoEditWatcher = FileWatcher(path: url.path, debounce: 1.0) { [weak self] _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                let after = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+                guard after != before else { return }
+                self.photoEditWatcher?.stop()
+                self.askPhotoSave(original: url, backup: backupURL, hadOriginal: hadOriginal)
+            }
+        }
+        photoEditWatcher?.start()
+    }
+
+    private func askPhotoSave(original: URL, backup: URL, hadOriginal: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "Photo edited in Photoshop"
+        alert.informativeText = "Save as new version (name-01.webp), replace original, or cancel?"
+        alert.addButton(withTitle: "Save as new version")
+        alert.addButton(withTitle: "Replace original")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            if hadOriginal {
+                let number = WebPNumbering.nextNumber(psdURL: original, counter: -1)
+                let out = WebPNumbering.outputURL(psdURL: original, number: number)
+                try? FileManager.default.copyItem(at: original, to: out)
+                try? FileManager.default.removeItem(at: original)
+                try? FileManager.default.moveItem(at: backup, to: original)
+            }
+        case .alertSecondButtonReturn:
+            try? FileManager.default.removeItem(at: backup)
+        default:
+            try? FileManager.default.removeItem(at: backup)
+        }
+        scheduleRenderPreview()
+    }
+
     // MARK: - Actions (top bar / photo)
 
     @objc private func sizeClicked(_ sender: NSButton) {
@@ -818,9 +1269,13 @@ final class ProductionView: NSView {
            existing.workingFolder == folder.path {
             edits = existing.edits
             layerSettings = existing.layerSettings
+            psdTextList = existing.psdTextList
+            overlayCounter = existing.overlayCounter
         } else {
             edits = EditStore()
             layerSettings = .defaults
+            psdTextList = [:]
+            overlayCounter = -1
         }
 
         files = collected
@@ -880,6 +1335,8 @@ final class ProductionView: NSView {
         canvasView.edit = currentEdit()
         updateWatermarkPlaceholder()
         updateLayerSelectionState()
+        psdManualTextField?.stringValue = edits.manualText(sizeKey: currentSizeKey(), fileName: url.lastPathComponent) ?? ""
+        scheduleLayer2Render()
         loadPreview(for: url)
         updateStatus()
     }
@@ -934,6 +1391,9 @@ final class ProductionView: NSView {
         }
         let preview = previewPixelSize()
         let project = makeProjectModel()
+        compositor.layer2Box = layerSettings.psdText.box
+        compositor.layer2Align = layerSettings.psdText.align
+        compositor.scanMode = settings.scanMode
         let image = compositor.render(project: project, imageIndex: currentIndex, canvasPixelSize: preview,
                                       photoSource: { [weak self] _ in self?.photoPreview })
         canvasView.compositedImage = image
@@ -1071,7 +1531,10 @@ final class ProductionView: NSView {
     private func applyLiveSettings() {
         settings = AppSettings.load()
         canvasView.settings = settings
+        compositor.scanMode = settings.scanMode
         refreshRotationField()
+        reloadScanModes()
+        scheduleLayer2Render()
     }
 
     // MARK: - Status
@@ -1100,7 +1563,9 @@ final class ProductionView: NSView {
             currentIndex: currentIndex,
             selectedSize: selectedSize,
             edits: edits,
-            layerSettings: layerSettings
+            layerSettings: layerSettings,
+            psdTextList: psdTextList,
+            overlayCounter: overlayCounter
         )
     }
 
@@ -1133,6 +1598,8 @@ final class ProductionView: NSView {
         currentIndex = min(max(0, model.currentIndex), files.count - 1)
         edits = model.edits
         layerSettings = model.layerSettings
+        psdTextList = model.psdTextList
+        overlayCounter = model.overlayCounter
         selectedSize = model.selectedSize
 
         if let size = selectedSize {

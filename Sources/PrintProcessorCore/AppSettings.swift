@@ -27,6 +27,18 @@ public struct AppSettings: Codable, Equatable {
     public var nudgeBasis: NudgeBasis
     /// Tooltip delay in seconds (0 disables tooltips).
     public var tooltipDelay: Double
+    /// Filename-scan mode serialised string, e.g. `text=right`.
+    public var scanMode: String
+    /// Saved scan modes shown in the one-click popup.
+    public var savedScanModes: [String]
+    /// Name of the PSD text layer targeted for layer 2 (default "TEXT").
+    public var psdTextLayerName: String
+    /// Minimum scale the layer-2 text may shrink to (fraction of natural size).
+    public var minTextScale: Double
+    /// Absolute path to the Photoshop `.app` bundle; empty = auto-detect.
+    public var photoshopPath: String
+    /// Absolute path to the cwebp binary; empty = resolve from known locations.
+    public var cwebpPath: String
 
     public static let defaults = AppSettings(
         doubleTapMs: 300,
@@ -34,7 +46,13 @@ public struct AppSettings: Codable, Equatable {
         scrollZoomSpeed: 1.0,
         scrollRotateSpeed: 1.0,
         nudgeBasis: .export,
-        tooltipDelay: 0.5
+        tooltipDelay: 0.5,
+        scanMode: "text=right",
+        savedScanModes: ["text=right", "text=left,watermark=right"],
+        psdTextLayerName: "TEXT",
+        minTextScale: 0.4,
+        photoshopPath: "",
+        cwebpPath: ""
     )
 
     public init(
@@ -43,7 +61,13 @@ public struct AppSettings: Codable, Equatable {
         scrollZoomSpeed: Double,
         scrollRotateSpeed: Double,
         nudgeBasis: NudgeBasis,
-        tooltipDelay: Double
+        tooltipDelay: Double,
+        scanMode: String = "text=right",
+        savedScanModes: [String] = ["text=right", "text=left,watermark=right"],
+        psdTextLayerName: String = "TEXT",
+        minTextScale: Double = 0.4,
+        photoshopPath: String = "",
+        cwebpPath: String = ""
     ) {
         self.doubleTapMs = doubleTapMs
         self.rotateStep = rotateStep
@@ -51,6 +75,12 @@ public struct AppSettings: Codable, Equatable {
         self.scrollRotateSpeed = scrollRotateSpeed
         self.nudgeBasis = nudgeBasis
         self.tooltipDelay = tooltipDelay
+        self.scanMode = scanMode
+        self.savedScanModes = savedScanModes
+        self.psdTextLayerName = psdTextLayerName
+        self.minTextScale = minTextScale
+        self.photoshopPath = photoshopPath
+        self.cwebpPath = cwebpPath
     }
 
     private static let storageKey = "com.johorstudio.printprocessor.AppSettings"

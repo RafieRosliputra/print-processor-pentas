@@ -9,6 +9,11 @@ final class SettingsView: NSView {
     private let rotateSpeedField = SettingsView.makeNumberField()
     private let nudgePopup = NSPopUpButton()
     private let tooltipDelayField = SettingsView.makeNumberField()
+    private let scanModeField = SettingsView.makeTextField()
+    private let textLayerNameField = SettingsView.makeTextField()
+    private let minTextScaleField = SettingsView.makeNumberField()
+    private let photoshopPathField = SettingsView.makeTextField()
+    private let cwebpPathField = SettingsView.makeTextField()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -26,6 +31,16 @@ final class SettingsView: NSView {
         field.isBezeled = true
         field.bezelStyle = .roundedBezel
         field.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        field.alignment = .left
+        return field
+    }
+
+    private static func makeTextField() -> NSTextField {
+        let field = NSTextField(string: "")
+        field.isEditable = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         field.alignment = .left
         return field
     }
@@ -56,6 +71,11 @@ final class SettingsView: NSView {
             ("Scroll rotate speed", rotateSpeedField, "Scroll rotate speed — rotation sensitivity multiplier. Shortcut: R + scroll"),
             ("Nudge pixel basis", nudgePopup, "Nudge basis — export or screen pixels. Shortcut: arrows (1 px) / Shift+arrows (10 px)"),
             ("Tooltip delay (s)", tooltipDelayField, "Tooltip delay — seconds before a tooltip appears (0 disables)"),
+            ("Filename scan mode", scanModeField, "Scan mode — which side of \" - \" goes to layer 2/1 (e.g. text=right or text=left,watermark=right)"),
+            ("PSD text layer name", textLayerNameField, "Text layer name — the layer targeted in Photoshop for layer 2 (default TEXT)"),
+            ("Min text scale", minTextScaleField, "Min text scale — smallest the layer-2 text may shrink to (fraction)"),
+            ("Photoshop path", photoshopPathField, "Photoshop path — absolute path to Photoshop.app (empty = auto-detect)"),
+            ("cwebp path", cwebpPathField, "cwebp path — absolute path to cwebp (empty = auto-detect)"),
         ]
 
         let form = NSStackView()
@@ -101,6 +121,11 @@ final class SettingsView: NSView {
         zoomSpeedField.stringValue = String(settings.scrollZoomSpeed)
         rotateSpeedField.stringValue = String(settings.scrollRotateSpeed)
         tooltipDelayField.stringValue = String(settings.tooltipDelay)
+        scanModeField.stringValue = settings.scanMode
+        textLayerNameField.stringValue = settings.psdTextLayerName
+        minTextScaleField.stringValue = String(settings.minTextScale)
+        photoshopPathField.stringValue = settings.photoshopPath
+        cwebpPathField.stringValue = settings.cwebpPath
         if let idx = NudgeBasis.allCases.firstIndex(of: settings.nudgeBasis) {
             nudgePopup.selectItem(at: idx)
         }
@@ -113,6 +138,9 @@ final class SettingsView: NSView {
         let zoomSpeed = Double(zoomSpeedField.stringValue) ?? current.scrollZoomSpeed
         let rotateSpeed = Double(rotateSpeedField.stringValue) ?? current.scrollRotateSpeed
         let tooltipDelay = Double(tooltipDelayField.stringValue) ?? current.tooltipDelay
+        let minTextScale = min(1, max(0.05, Double(minTextScaleField.stringValue) ?? current.minTextScale))
+        let scanMode = scanModeField.stringValue.trimmingCharacters(in: .whitespaces)
+        let layerName = textLayerNameField.stringValue.trimmingCharacters(in: .whitespaces)
         let basis = NudgeBasis.allCases[safe: nudgePopup.indexOfSelectedItem] ?? current.nudgeBasis
         return AppSettings(
             doubleTapMs: doubleTap,
@@ -120,7 +148,13 @@ final class SettingsView: NSView {
             scrollZoomSpeed: zoomSpeed,
             scrollRotateSpeed: rotateSpeed,
             nudgeBasis: basis,
-            tooltipDelay: tooltipDelay
+            tooltipDelay: tooltipDelay,
+            scanMode: scanMode.isEmpty ? current.scanMode : scanMode,
+            savedScanModes: current.savedScanModes,
+            psdTextLayerName: layerName.isEmpty ? current.psdTextLayerName : layerName,
+            minTextScale: minTextScale,
+            photoshopPath: photoshopPathField.stringValue.trimmingCharacters(in: .whitespaces),
+            cwebpPath: cwebpPathField.stringValue.trimmingCharacters(in: .whitespaces)
         )
     }
 

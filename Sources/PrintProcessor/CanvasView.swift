@@ -1,10 +1,11 @@
 import AppKit
 import PrintProcessorCore
 
-/// A layer (1 = watermark, 3 = overlay) that can be selected on the canvas and
-/// free-transformed with the red box + handles.
+/// A layer (1 = watermark, 2 = PSD text, 3 = overlay) that can be selected on
+/// the canvas and free-transformed with the red box + handles.
 enum SelectedLayer {
     case watermark
+    case psdText
     case overlay
 }
 
@@ -58,6 +59,12 @@ final class CanvasView: NSView {
         didSet { needsDisplay = true }
     }
 
+    // Layer 2 (PSD text) box state (normalised 0…1; nil = no PSD loaded).
+    var psdTextBox: PSDTextBox? {
+        didSet { needsDisplay = true; updateSelectionLayer() }
+    }
+    var psdTextAlign: TextAlign = .centre
+
     // MARK: - Callbacks
 
     /// Layer-4 edit produced by user input (`commit` = discrete/undoable).
@@ -77,12 +84,17 @@ final class CanvasView: NSView {
     var onWatermarkChanged: ((WatermarkTransform, Bool, Bool) -> Void)?
     /// Layer-3 transform changed (same commit/option convention).
     var onOverlayChanged: ((OverlayTransform, Bool, Bool) -> Void)?
+    /// Layer-2 bounding box changed. `commit` = gesture finished.
+    var onPSDTextBoxChanged: ((PSDTextBox, Bool) -> Void)?
+    /// Middle-click (button 2) hit a layer element: 2 / 3 / 4.
+    var onMiddleClick: ((Int) -> Void)?
 
     // MARK: - Internal state
 
     private let paperLayer = CALayer()
     private let compositeLayer = CALayer()
     private let selectionLayer = CAShapeLayer()
+    private let hoverLayer = CAShapeLayer()
     private let hintLabel = NSTextField(labelWithString: "")
 
     private var selection: SelectedLayer? {
@@ -109,6 +121,16 @@ final class CanvasView: NSView {
     private var transformGestureOption = false
     private var transformGestureStartWatermark = WatermarkTransform.identity
     private var transformGestureStartOverlay = OverlayTransform.identity
+    private var transformGestureStartPSDBox = PSDTextBox.defaults
+
+    // Layer-2 box rubber-band drawing state (armed by the panel's Draw box).
+    private var psdBoxDrawingEnabled = false
+    private var psdBoxDrawStart: CGPoint? = nil
+
+    // Hover glow (layer 2 / 3).
+    private var hoveredLayer: Int? {
+        didSet { if hoveredLayer != oldValue { needsDisplay = true; updateGlow() } }
+    }
 
     private static let padding: CGFloat = 28
     private static let minScale = 0.05
@@ -139,6 +161,11 @@ final class CanvasView: NSView {
         selectionLayer.strokeColor = NSColor.systemRed.cgColor
         selectionLayer.lineWidth = 1.5
         layer?.addSublayer(selectionLayer)
+
+        hoverLayer.fillColor = NSColor.glow.withAlphaComponent(0.12).cgColor
+        hoverLayer.strokeColor = NSColor.glow.cgColor
+        hoverLayer.lineWidth = 2
+        layer?.addSublayer(hoverLayer)
 
         hintLabel.font = NSFont.systemFont(ofSize: 15, weight: .medium)
         hintLabel.textColor = .dimText
@@ -175,6 +202,7 @@ final class CanvasView: NSView {
         paperLayer.frame = paperRect()
         compositeLayer.frame = paperLayer.bounds
         updateSelectionLayer()
+        updateHoverLayer()
     }
 
     /// The paper rectangle fitted into the view bounds.
@@ -253,8 +281,15 @@ final class CanvasView: NSView {
         switch selection {
         case .overlay: return overlayBox()
         case .watermark: return watermarkBox()
+        case .psdText: return psdTextBoxCanvasRect()
         case nil: return .zero
         }
+    }
+
+    /// Layer-2 box in canvas (preview pixel) coordinates.
+    private func psdTextBoxCanvasRect() -> CGRect {
+        guard let box = psdTextBox else { return .zero }
+        return box.pixelRect(canvas: compositePixelSize)
     }
 
     // MARK: - Selection drawing
@@ -278,9 +313,11 @@ final class CanvasView: NSView {
             path.addRect(CGRect(x: handle.x - Self.handleSize / 2, y: handle.y - Self.handleSize / 2,
                                 width: Self.handleSize, height: Self.handleSize))
         }
-        for handle in rotateHandles(in: box) {
-            path.addEllipse(in: CGRect(x: handle.x - Self.rotateHandleRadius, y: handle.y - Self.rotateHandleRadius,
-                                       width: Self.rotateHandleRadius * 2, height: Self.rotateHandleRadius * 2))
+        if selection != .psdText {
+            for handle in rotateHandles(in: box) {
+                path.addEllipse(in: CGRect(x: handle.x - Self.rotateHandleRadius, y: handle.y - Self.rotateHandleRadius,
+                                           width: Self.rotateHandleRadius * 2, height: Self.rotateHandleRadius * 2))
+            }
         }
         selectionLayer.path = path
     }
@@ -295,6 +332,28 @@ final class CanvasView: NSView {
             }
         }
         return points
+    }
+
+    /// Orange glow around a hovered layer-2/3 element.
+    private func updateHoverLayer() {
+        guard let hovered = hoveredLayer else {
+            hoverLayer.path = nil
+            return
+        }
+        let box: CGRect
+        switch hovered {
+        case 2: box = psdTextBoxCanvasRect()
+        case 3: box = overlayBox()
+        default: box = .zero
+        }
+        guard box.width > 0, box.height > 0 else {
+            hoverLayer.path = nil
+            return
+        }
+        let screen = box.toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4)
+        let path = CGMutablePath()
+        path.addRect(screen)
+        hoverLayer.path = path
     }
 
     private func rotateHandles(in box: CGRect) -> [CGPoint] {
@@ -373,7 +432,7 @@ final class CanvasView: NSView {
         for area in trackingAreas { removeTrackingArea(area) }
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil))
     }
@@ -385,7 +444,47 @@ final class CanvasView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         isMouseOver = false
+        hoveredLayer = nil
         updateGlow()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard !locked else { hoveredLayer = nil; return }
+        let screenPoint = convert(event.locationInWindow, from: nil)
+        if let psdBox = psdTextBox,
+           psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            hoveredLayer = 2
+        } else if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            hoveredLayer = 3
+        } else {
+            hoveredLayer = nil
+        }
+    }
+
+    /// Middle-click (button 2) opens the hovered layer element in Photoshop.
+    override func otherMouseDown(with event: NSEvent) {
+        guard !locked else { super.otherMouseDown(with: event); return }
+        if event.buttonNumber == 2 {
+            let screenPoint = convert(event.locationInWindow, from: nil)
+            var layer: Int? = nil
+            if let psdBox = psdTextBox,
+               psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+                layer = 2
+            } else if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+                layer = 3
+            } else if paperRect().contains(screenPoint) {
+                layer = 4
+            }
+            if let layer = layer { onMiddleClick?(layer) }
+            return
+        }
+        super.otherMouseDown(with: event)
+    }
+
+    /// Arm the next canvas drag to draw the layer-2 bounding box.
+    func armPSDBoxDrawing() {
+        psdBoxDrawingEnabled = true
+        selection = .psdText
     }
 
     // MARK: - Mouse (selection + layer-4 pan)
@@ -399,9 +498,19 @@ final class CanvasView: NSView {
         let screenPoint = convert(event.locationInWindow, from: nil)
         let canvas = canvasPoint(screenPoint)
 
+        // 0. Rubber-band draw of the layer-2 box (armed by the panel).
+        if psdBoxDrawingEnabled {
+            psdBoxDrawingEnabled = false
+            psdBoxDrawStart = screenPoint
+            selection = .psdText
+            updateSelectionLayer()
+            return
+        }
+
         // 1. Handle an existing selection (rotate / scale / move / deselect).
         if let sel = selection {
-            if hitRotateHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
+            if sel != .psdText,
+               hitRotateHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
                 beginTransform(sel, mode: .rotate, start: canvas, option: event.modifierFlags.contains(.option))
                 return
             }
@@ -417,7 +526,13 @@ final class CanvasView: NSView {
             selection = nil
         }
 
-        // 2. Select overlay (above photo) or watermark when clicked.
+        // 2. Select psd text box, overlay (above photo), or watermark when clicked.
+        if let psdBox = psdTextBox,
+           psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            selection = .psdText
+            beginTransform(.psdText, mode: .move, start: canvas, option: false)
+            return
+        }
         if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
             selection = .overlay
             beginTransform(.overlay, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
@@ -438,6 +553,29 @@ final class CanvasView: NSView {
         let screenPoint = convert(event.locationInWindow, from: nil)
         let canvas = canvasPoint(screenPoint)
 
+        // Rubber-band layer-2 box drawing.
+        if let start = psdBoxDrawStart {
+            let rect = paperRect()
+            let minX = min(start.x, screenPoint.x)
+            let maxX = max(start.x, screenPoint.x)
+            let minY = min(start.y, screenPoint.y)
+            let maxY = max(start.y, screenPoint.y)
+            let clampedX = max(rect.minX, minX)
+            let clampedMaxX = min(rect.maxX, maxX)
+            let clampedBottom = max(rect.minY, minY)
+            let clampedTop = min(rect.maxY, maxY)
+            // View coords are y-up, so the top edge maps to rect.maxY.
+            let box = PSDTextBox(
+                x: Double((clampedX - rect.minX) / rect.width),
+                y: Double((rect.maxY - clampedTop) / rect.height),
+                width: Double((clampedMaxX - clampedX) / rect.width),
+                height: Double((clampedTop - clampedBottom) / rect.height)
+            ).clamped()
+            psdTextBox = box
+            onPSDTextBoxChanged?(box, false)
+            return
+        }
+
         if let layer = transformGestureLayer {
             applyTransformDrag(layer, canvas: canvas, commit: false)
             return
@@ -454,6 +592,14 @@ final class CanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if psdBoxDrawStart != nil {
+            psdBoxDrawStart = nil
+            if let box = psdTextBox {
+                onPSDTextBoxChanged?(box, true)
+            }
+            return
+        }
+
         if let layer = transformGestureLayer {
             let canvas = canvasPoint(convert(event.locationInWindow, from: nil))
             applyTransformDrag(layer, canvas: canvas, commit: true)
@@ -478,6 +624,7 @@ final class CanvasView: NSView {
         transformGestureOption = option
         transformGestureStartWatermark = watermarkTransform
         transformGestureStartOverlay = overlayTransform
+        transformGestureStartPSDBox = psdTextBox ?? .defaults
         beginGesture()
     }
 
@@ -531,6 +678,32 @@ final class CanvasView: NSView {
             }
             watermarkTransform = t
             onWatermarkChanged?(t, commit, transformGestureOption)
+
+        case .psdText:
+            var b = transformGestureStartPSDBox
+            let cw = Double(compositePixelSize.width)
+            let ch = Double(compositePixelSize.height)
+            switch transformGestureMode {
+            case .move:
+                b.x += dx / cw
+                b.y -= dy / ch
+            case .scale:
+                let startRect = transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize)
+                let center = startRect.center
+                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
+                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
+                let f = min(Self.maxScale, max(Self.minScale, nowDist / startDist))
+                let cx = b.x + b.width / 2
+                let cy = b.y + b.height / 2
+                b.width = max(0.01, min(1, b.width * f))
+                b.height = max(0.01, min(1, b.height * f))
+                b.x = max(0, min(1 - b.width, cx - b.width / 2))
+                b.y = max(0, min(1 - b.height, cy - b.height / 2))
+            case .rotate:
+                break
+            }
+            psdTextBox = b.clamped()
+            onPSDTextBoxChanged?(psdTextBox ?? .defaults, commit)
         }
         updateSelectionLayer()
     }
@@ -731,6 +904,7 @@ extension SelectedLayer {
     var layerNumber: Int {
         switch self {
         case .watermark: return 1
+        case .psdText: return 2
         case .overlay: return 3
         }
     }

@@ -16,6 +16,10 @@ public struct ProjectModel: Equatable {
     public var edits: EditStore
     /// Layer settings (visibility, watermark, overlay, gradient, backgrounds).
     public var layerSettings: LayerSettings
+    /// Pasted/imported text list (leading number → text) for layer 2.
+    public var psdTextList: [String: String]
+    /// Highest layer-3 webp number ever exported (never reused); -1 = none yet.
+    public var overlayCounter: Int
 
     public init(
         workingFolder: String,
@@ -23,7 +27,9 @@ public struct ProjectModel: Equatable {
         currentIndex: Int = 0,
         selectedSize: PaperSize? = nil,
         edits: EditStore = EditStore(),
-        layerSettings: LayerSettings = .defaults
+        layerSettings: LayerSettings = .defaults,
+        psdTextList: [String: String] = [:],
+        overlayCounter: Int = -1
     ) {
         self.workingFolder = workingFolder
         self.files = files
@@ -31,6 +37,8 @@ public struct ProjectModel: Equatable {
         self.selectedSize = selectedSize
         self.edits = edits
         self.layerSettings = layerSettings
+        self.psdTextList = psdTextList
+        self.overlayCounter = overlayCounter
     }
 
     /// Absolute URL of the project JSON inside the working folder.
@@ -63,6 +71,8 @@ extension ProjectModel: Codable {
         case selectedSize
         case edits
         case layerSettings
+        case psdTextList
+        case overlayCounter
     }
 
     public init(from decoder: Decoder) throws {
@@ -73,6 +83,8 @@ extension ProjectModel: Codable {
         selectedSize = try c.decodeIfPresent(PaperSize.self, forKey: .selectedSize)
         edits = try c.decodeIfPresent(EditStore.self, forKey: .edits) ?? EditStore()
         layerSettings = try c.decodeIfPresent(LayerSettings.self, forKey: .layerSettings) ?? .defaults
+        psdTextList = try c.decodeIfPresent([String: String].self, forKey: .psdTextList) ?? [:]
+        overlayCounter = try c.decodeIfPresent(Int.self, forKey: .overlayCounter) ?? -1
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -83,5 +95,7 @@ extension ProjectModel: Codable {
         try c.encode(selectedSize, forKey: .selectedSize)
         try c.encode(edits, forKey: .edits)
         try c.encode(layerSettings, forKey: .layerSettings)
+        try c.encode(psdTextList, forKey: .psdTextList)
+        try c.encode(overlayCounter, forKey: .overlayCounter)
     }
 }

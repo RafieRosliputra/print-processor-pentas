@@ -43,6 +43,35 @@ func writeTempPNG(_ image: CGImage, name: String) -> String {
     return url.path
 }
 
+/// Write a PNG to an exact URL (used by fake runners/encoders).
+func writePNG(_ image: CGImage, to url: URL) -> Bool {
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        return false
+    }
+    CGImageDestinationAddImage(dest, image, nil)
+    return CGImageDestinationFinalize(dest)
+}
+
+/// A writable temp directory under the current working directory (the sandbox
+/// blocks the system temp dir, so tests create their own).
+func makeTempDir(_ label: String) -> String {
+    let dir = FileManager.default.currentDirectoryPath + "/.check-\(label)-\(UUID().uuidString)"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+/// Create a file with the given bytes (Data.write works where `createFile`
+/// is blocked by the harness sandbox).
+@discardableResult
+func makeFile(_ path: String, _ bytes: [UInt8] = []) -> Bool {
+    do {
+        try Data(bytes).write(to: URL(fileURLWithPath: path))
+        return true
+    } catch {
+        return false
+    }
+}
+
 /// Sample a pixel at (x, y) with y measured from the bottom (canvas convention,
 /// matching the renderer's y-up coordinate space). Bitmap buffers are stored
 /// top-down, so the row index is inverted.
@@ -248,6 +277,93 @@ do {
     } else {
         check(false, "Compositor: render 1200x1800")
     }
+}
+
+// MARK: - Milestone 3 additions (SPEC §6/§7 + middle-click)
+
+// 2. TextSourceResolver: list + filename scan.
+do {
+    let list = TextSourceResolver.parseList("122 - Norman Hakim\n99\tAli Baba")
+    check(list["122"] == "Norman Hakim", "TextSourceResolver parses \"122 - Norman Hakim\" -> \"Norman Hakim\"")
+    check(list["99"] == "Ali Baba", "TextSourceResolver parses tab-separated list line")
+
+    let resolved = TextSourceResolver.resolve(fileName: "122.jpg", manualText: "", list: list, scanMode: .default)
+    check(resolved.text == "Norman Hakim", "list resolves 122.jpg -> \"Norman Hakim\" (got \"\(resolved.text)\")")
+
+    let scanMode = ScanMode.parse("text=left,watermark=right")
+    let scanned = TextSourceResolver.scan(fileName: "Tingkatan 1C - 01.jpg", mode: scanMode)
+    check(scanned.text == "Tingkatan 1C" && scanned.watermark == "01",
+          "scan text=left,watermark=right -> \"Tingkatan 1C\" + \"01\" (got \"\(scanned.text)\"/\"\(scanned.watermark)\")")
+}
+
+// 3. PSDTextRenderer caches the same text (fake runner called once).
+do {
+    final class FakeRunner: PhotoshopRunnerProtocol {
+        var calls = 0
+        func renderPNG(psdPath: String, text: String?, layerName: String, outputPNG: String) -> Bool {
+            calls += 1
+            guard let img = makeSolidImage(width: 40, height: 10, r: 1, g: 1, b: 1, a: 1) else { return false }
+            return writePNG(img, to: URL(fileURLWithPath: outputPNG))
+        }
+    }
+    let tmp = makeTempDir("psdtext")
+    let psdPath = tmp + "/template.psd"
+    makeFile(psdPath, [0x38, 0x42, 0x50, 0x53])
+
+    let runner = FakeRunner()
+    let renderer = PSDTextRenderer(runner: runner, cacheDirectory: tmp, layerName: "TEXT")
+    let first = renderer.render(psdPath: psdPath, text: "Norman Hakim")
+    let second = renderer.render(psdPath: psdPath, text: "Norman Hakim")
+    check(first != nil && second != nil, "PSDTextRenderer renders text via fake runner")
+    check(runner.calls == 1, "PSDTextRenderer cache hit on same text (runner called \(runner.calls)x, expected 1)")
+}
+
+// 4. Never-reuse webp numbering: -00,-01,-04 present, -01 deleted -> -05.
+do {
+    let tmp = makeTempDir("webp")
+    let psdURL = URL(fileURLWithPath: tmp + "/overlay.psd")
+    makeFile(psdURL.path)
+    for n in [0, 1, 4] {
+        makeFile(WebPNumbering.outputURL(psdURL: psdURL, number: n).path, [1])
+    }
+    try? FileManager.default.removeItem(atPath: WebPNumbering.outputURL(psdURL: psdURL, number: 1).path)
+    let next = WebPNumbering.nextNumber(psdURL: psdURL, counter: 4)
+    check(next == 5, "numbering continues at -05 after -01 deleted (got -\(String(format: "%02d", next)))")
+    let out = WebPNumbering.outputURL(psdURL: psdURL, number: next)
+    check(!FileManager.default.fileExists(atPath: out.path), "next number never overwrites an existing webp")
+}
+
+// 5. PSD exporter writes numbered webp beside the PSD + FileWatcher fires.
+do {
+    let tmp = makeTempDir("watch")
+    let psdURL = URL(fileURLWithPath: tmp + "/badge.psd")
+    makeFile(psdURL.path, [0x38, 0x42, 0x50, 0x53])
+
+    let exporter = PSDOverlayExporter(
+        flatten: { _ in makeSolidImage(width: 64, height: 64, r: 0, g: 0, b: 1, a: 1) },
+        encode: { img, url in writePNG(img, to: url) }
+    )
+    let first = exporter.export(psdURL: psdURL, counter: -1)
+    check(first?.lastPathComponent == "badge-00.webp",
+          "PSD exporter writes <name>-00.webp beside the PSD (got \(first?.lastPathComponent ?? "nil"))")
+    let second = exporter.export(psdURL: psdURL, counter: 0)
+    check(second?.lastPathComponent == "badge-01.webp",
+          "PSD exporter writes <name>-01.webp next (got \(second?.lastPathComponent ?? "nil"))")
+
+    let sem = DispatchSemaphore(value: 0)
+    var watched: [String] = []
+    let watcher = FileWatcher(path: psdURL.path, debounce: 0.05) { p in
+        watched.append(p)
+        sem.signal()
+    }
+    watcher.start()
+    // Simulate a save (overwrite the file so the .write event fires).
+    if let before = try? Data(contentsOf: psdURL) {
+        try? Data(before + [0x00]).write(to: psdURL)
+    }
+    let fired = sem.wait(timeout: .now() + 3.0) == .success
+    check(fired && watched.contains(psdURL.path), "FileWatcher detects a PSD save (fired=\(fired))")
+    watcher.stop()
 }
 
 if failures == 0 {

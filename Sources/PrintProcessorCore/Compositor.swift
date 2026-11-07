@@ -161,6 +161,16 @@ public final class Compositor {
     /// Path → decoded image cache (overlay / bg5 / bg6 image), keyed by path.
     private var imageCache: [String: CGImage] = [:]
 
+    /// Layer-2 styled text image (trimmed), set by the controller after a
+    /// background Photoshop render. Drawn fitted into `layer2Box`.
+    public var layer2Image: CGImage?
+    /// Normalised layer-2 bounding box (per-image override already applied).
+    public var layer2Box: PSDTextBox = .defaults
+    /// Horizontal alignment for layer 2.
+    public var layer2Align: TextAlign = .centre
+    /// Filename-scan mode used to derive layer-1/2 text.
+    public var scanMode: String = "text=right"
+
     public init() {}
 
     /// Drop cached decoded images (e.g. after loading a new overlay file).
@@ -228,18 +238,40 @@ public final class Compositor {
         if ls.enabled.layer3, let image = image(atPath: ls.overlay.path) {
             drawOverlay(ctx, image, canvas: canvas, overlay: ls.overlay, offsetScale: offsetScale)
         }
-        // Layer 2 — placeholder (PSD text); returns nil for now.
-        // Layer 1 — watermark text (default derived from the file name).
+        // Layer 2 — PSD styled text (trimmed image fitted into the box).
+        if ls.enabled.layer2, let image = layer2Image {
+            let boxRect = layer2Box.pixelRect(canvas: canvas)
+            let drawRect = PSDTextLayout.fittedRect(
+                box: boxRect,
+                imageSize: CGSize(width: image.width, height: image.height),
+                align: layer2Align
+            )
+            ctx.draw(image, in: drawRect)
+        }
+        // Layer 1 — watermark text (manual edit → list → filename scan).
         if ls.enabled.layer1 {
             var watermark = ls.watermark
             if watermark.text.isEmpty {
                 let fileName = project.files.indices.contains(imageIndex) ? project.files[imageIndex] : ""
-                watermark.text = WatermarkTextProvider.current(fileName)
+                watermark.text = resolveText(project: project, fileName: fileName).watermark
             }
             drawWatermark(ctx, watermark, canvas: canvas)
         }
 
         return ctx.makeImage()
+    }
+
+    // MARK: - Text resolution
+
+    private func resolveText(project: ProjectModel, fileName: String) -> TextResolution {
+        let sizeKey = project.selectedSize?.rawValue ?? ""
+        let manualText = project.edits.manualText(sizeKey: sizeKey, fileName: fileName) ?? ""
+        return TextSourceResolver.resolve(
+            fileName: fileName,
+            manualText: manualText,
+            list: project.psdTextList,
+            scanMode: ScanMode.parse(scanMode)
+        )
     }
 
     // MARK: - Photo edit lookup

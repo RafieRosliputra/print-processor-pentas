@@ -132,6 +132,7 @@ final class SettingsView: NSView {
         let settings = readFields()
         settings.save()
         fill(from: settings)
+        NotificationCenter.default.post(name: .appSettingsDidChange, object: nil)
     }
 
     @objc private func revertClicked() {
@@ -149,6 +150,7 @@ final class SettingsView: NSView {
         if alert.runModal() == .alertFirstButtonReturn {
             AppSettings.defaults.save()
             reload()
+            NotificationCenter.default.post(name: .appSettingsDidChange, object: nil)
         }
     }
 }

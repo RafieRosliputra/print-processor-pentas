@@ -71,3 +71,9 @@ public struct AppSettings: Codable, Equatable {
         }
     }
 }
+
+public extension Notification.Name {
+    /// Posted when persisted AppSettings change (e.g. the Settings tab Apply
+    /// button) so live views can reload them without restarting.
+    static let appSettingsDidChange = Notification.Name("com.johorstudio.printprocessor.appSettingsDidChange")
+}

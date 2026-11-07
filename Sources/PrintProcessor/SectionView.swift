@@ -26,6 +26,17 @@ final class SectionView: NSView {
         build()
     }
 
+    /// - Parameters:
+    ///   - title: Section header text.
+    ///   - body: Custom content view for the section body.
+    init(title: String, body: NSView) {
+        self.sectionTitle = title
+        self.titleLabel = makeLabel(title, size: 13, weight: .semibold, color: .labelColor)
+        self.bodyView = body
+        super.init(frame: .zero)
+        build()
+    }
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
     }

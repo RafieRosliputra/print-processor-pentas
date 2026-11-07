@@ -1,61 +1,96 @@
 import AppKit
 import PrintProcessorCore
 
-/// Interactive layer-4 canvas. Renders the paper rectangle (chosen size ratio
-/// fitted in the view) and the current subject photo as a downscaled preview,
-/// with zoom / pan / rotate / nudge / navigation handled here and reported
-/// upward through callbacks.
+/// A layer (1 = watermark, 3 = overlay) that can be selected on the canvas and
+/// free-transformed with the red box + handles.
+enum SelectedLayer {
+    case watermark
+    case overlay
+}
+
+/// Interactive canvas. Draws the composited preview (all layers) into the paper
+/// rect, keeps the layer-4 gestures (pan / zoom / rotate / nudge / navigation),
+/// and lets the user select and free-transform layer 1 (watermark) and layer 3
+/// (overlay) with a red box, 8 handles and a rotate zone outside the corners.
 final class CanvasView: NSView {
     // MARK: - Display state (owned by the controller)
 
-    /// True until a paper size is chosen: imports and edits are ignored and a
-    /// hint is shown.
+    /// True until a paper size is chosen.
     var locked: Bool = true {
         didSet { needsDisplay = true; needsLayout = true; updateHint() }
     }
 
-    /// Display width/height ratio of the paper rect (nil = no size chosen).
+    /// Display width/height ratio of the paper rect.
     var paperAspect: CGFloat? {
         didSet { needsLayout = true }
     }
 
-    /// Paper export-pixel size (used for export-pixel nudges). nil while no size.
+    /// Paper export-pixel size (used for export-pixel nudges).
     var paperPixelSize: CGSize? {
         didSet { needsLayout = true }
     }
 
-    /// Decoded preview image to draw, or nil while none is loaded.
-    var image: CGImage? {
-        didSet { updatePhotoContents() }
+    /// Composited preview image (all layers) to draw into the paper rect.
+    var compositedImage: CGImage? {
+        didSet { compositeLayer.contents = compositedImage; needsLayout = true; updateHint() }
     }
 
-    /// Current placement. Mutating this applies the transform without notifying.
+    /// Pixel size the composited image was rendered at (canvas coordinates).
+    var compositePixelSize: CGSize = CGSize(width: 1, height: 1) {
+        didSet { needsLayout = true }
+    }
+
+    /// Current layer-4 placement (mutating reports upward via `onEdit`).
     var edit: ImageEdit = .identity {
-        didSet { applyTransform() }
+        didSet { needsDisplay = true }
     }
 
     /// Live settings for zoom/rotate speed, rotate step and nudge basis.
     var settings: AppSettings = .defaults
 
+    // Layer 1 / 3 selection state (canvas coordinates, y-up).
+    var watermarkBaseSize: CGSize?
+    var overlayBaseSize: CGSize?
+    var watermarkTransform: WatermarkTransform = .identity {
+        didSet { needsDisplay = true }
+    }
+    var overlayTransform: OverlayTransform = .identity {
+        didSet { needsDisplay = true }
+    }
+
     // MARK: - Callbacks
 
-    /// A new edit produced by user input. `commit` is true for a discrete,
-    /// undoable change; false for a continuous gesture that is still in flight.
+    /// Layer-4 edit produced by user input (`commit` = discrete/undoable).
     var onEdit: ((ImageEdit, Bool) -> Void)?
-    /// A continuous gesture (drag / scroll) just started — record a baseline.
+    /// A continuous layer-4 gesture just started — record an undo baseline.
     var onGestureBegan: (() -> Void)?
     var onNextFile: (() -> Void)?
     var onPreviousFile: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
-    /// Files/folders dropped onto the canvas.
     var onDropFiles: (([URL]) -> Void)?
+
+    /// The selection changed (nil = deselected). `1`/`3` map to the layer.
+    var onSelectionChanged: ((Int?) -> Void)?
+    /// Layer-1 transform changed. `commit` = gesture finished; `option` = the
+    /// Option key was held (write a per-image override).
+    var onWatermarkChanged: ((WatermarkTransform, Bool, Bool) -> Void)?
+    /// Layer-3 transform changed (same commit/option convention).
+    var onOverlayChanged: ((OverlayTransform, Bool, Bool) -> Void)?
 
     // MARK: - Internal state
 
     private let paperLayer = CALayer()
-    private let photoLayer = CALayer()
+    private let compositeLayer = CALayer()
+    private let selectionLayer = CAShapeLayer()
     private let hintLabel = NSTextField(labelWithString: "")
+
+    private var selection: SelectedLayer? {
+        didSet {
+            updateSelectionLayer()
+            onSelectionChanged?(selection?.layerNumber)
+        }
+    }
 
     private var isMouseOver = false
     private var isRDown = false
@@ -66,10 +101,23 @@ final class CanvasView: NSView {
     private var gestureActive = false
     private var gestureEndWorkItem: DispatchWorkItem?
 
+    // Layer 1 / 3 free-transform gesture state.
+    private enum TransformMode { case move, scale, rotate }
+    private var transformGestureLayer: SelectedLayer?
+    private var transformGestureMode: TransformMode = .move
+    private var transformGestureStart: CGPoint = .zero      // canvas coordinates
+    private var transformGestureOption = false
+    private var transformGestureStartWatermark = WatermarkTransform.identity
+    private var transformGestureStartOverlay = OverlayTransform.identity
+
     private static let padding: CGFloat = 28
     private static let minScale = 0.05
     private static let maxScale = 50.0
     private static let gestureIdleMs = 400
+    private static let handleSize: CGFloat = 8
+    private static let rotateHandleRadius: CGFloat = 7
+    private static let rotateOffset: CGFloat = 22
+    private static let hitThreshold: CGFloat = 8
 
     // MARK: - Init
 
@@ -84,10 +132,13 @@ final class CanvasView: NSView {
         paperLayer.cornerRadius = 2
         layer?.addSublayer(paperLayer)
 
-        photoLayer.contentsGravity = .resizeAspect
-        photoLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-        photoLayer.masksToBounds = false
-        layer?.addSublayer(photoLayer)
+        compositeLayer.contentsGravity = .resize
+        paperLayer.addSublayer(compositeLayer)
+
+        selectionLayer.fillColor = nil
+        selectionLayer.strokeColor = NSColor.systemRed.cgColor
+        selectionLayer.lineWidth = 1.5
+        layer?.addSublayer(selectionLayer)
 
         hintLabel.font = NSFont.systemFont(ofSize: 15, weight: .medium)
         hintLabel.textColor = .dimText
@@ -122,9 +173,8 @@ final class CanvasView: NSView {
     override func layout() {
         super.layout()
         paperLayer.frame = paperRect()
-        photoLayer.position = paperRect().center
-        photoLayer.bounds = fittedImageBounds()
-        applyTransform()
+        compositeLayer.frame = paperLayer.bounds
+        updateSelectionLayer()
     }
 
     /// The paper rectangle fitted into the view bounds.
@@ -147,44 +197,130 @@ final class CanvasView: NSView {
         )
     }
 
-    /// Size the photo preview takes at Fit (letterboxed inside the paper rect).
-    private func fittedImageBounds() -> CGRect {
+    /// Screen points per canvas point (composite pixel).
+    private func screenScale() -> CGFloat {
+        guard compositePixelSize.width > 0 else { return 1 }
+        return paperRect().width / compositePixelSize.width
+    }
+
+    /// Ratio composite-pixel width → canonical paper-pixel width, used to
+    /// rescale stored pixel offsets (layer 4 / overlay) into preview space.
+    private func canvasOffsetScale() -> CGFloat {
+        guard let paper = paperPixelSize, paper.width > 0, compositePixelSize.width > 0 else { return 1 }
+        return compositePixelSize.width / paper.width
+    }
+
+    private func canvasPoint(_ p: NSPoint) -> CGPoint {
         let rect = paperRect()
-        guard let image = image, image.width > 0, image.height > 0 else {
-            return CGRect(origin: .zero, size: rect.size)
+        let s = screenScale()
+        return CGPoint(x: (p.x - rect.minX) / s, y: (p.y - rect.minY) / s)
+    }
+
+    private func screenPoint(_ p: CGPoint) -> CGPoint {
+        let rect = paperRect()
+        let s = screenScale()
+        return CGPoint(x: rect.minX + p.x * s, y: rect.minY + p.y * s)
+    }
+
+    // MARK: - Layer rects (canvas coordinates)
+
+    private func overlayBox() -> CGRect {
+        guard let base = overlayBaseSize, base.width > 0, base.height > 0 else { return .zero }
+        let s = canvasOffsetScale()
+        let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
+        let t = LayerGeometry.centeredTransform(
+            canvas: compositePixelSize,
+            offsetX: overlayTransform.offsetX * s,
+            offsetY: overlayTransform.offsetY * s,
+            scale: overlayTransform.scale,
+            rotationDeg: overlayTransform.rotationDeg
+        )
+        return LayerGeometry.boundingBox(of: local, transform: t)
+    }
+
+    private func watermarkBox() -> CGRect {
+        guard let base = watermarkBaseSize, base.width > 0, base.height > 0 else { return .zero }
+        let s = watermarkTransform.scale
+        let local = CGRect(x: -base.width * s, y: 0, width: base.width * s, height: base.height * s)
+        let ax = CGFloat(Double(compositePixelSize.width) * (1 - watermarkTransform.offsetFractionX))
+        let ay = CGFloat(Double(compositePixelSize.height) * watermarkTransform.offsetFractionY)
+        let t = CGAffineTransform(translationX: ax, y: ay)
+            .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermarkTransform.rotationDeg * .pi / 180)))
+        return LayerGeometry.boundingBox(of: local, transform: t)
+    }
+
+    private func selectionBox() -> CGRect {
+        switch selection {
+        case .overlay: return overlayBox()
+        case .watermark: return watermarkBox()
+        case nil: return .zero
         }
-        let aspect = CGFloat(image.width) / CGFloat(image.height)
-        var w = rect.width
-        var h = w / aspect
-        if h > rect.height {
-            h = rect.height
-            w = h * aspect
+    }
+
+    // MARK: - Selection drawing
+
+    private func updateSelectionLayer() {
+        guard selection != nil else {
+            selectionLayer.path = nil
+            return
         }
-        return CGRect(x: 0, y: 0, width: w, height: h)
+        let canvasBox = selectionBox()
+        guard canvasBox.width > 0, canvasBox.height > 0 else {
+            selectionLayer.path = nil
+            return
+        }
+        let box = canvasBox.toScreen(scale: screenScale(), paper: paperRect())
+
+        let path = CGMutablePath()
+        path.addRect(box)
+
+        for handle in scaleHandles(in: box) {
+            path.addRect(CGRect(x: handle.x - Self.handleSize / 2, y: handle.y - Self.handleSize / 2,
+                                width: Self.handleSize, height: Self.handleSize))
+        }
+        for handle in rotateHandles(in: box) {
+            path.addEllipse(in: CGRect(x: handle.x - Self.rotateHandleRadius, y: handle.y - Self.rotateHandleRadius,
+                                       width: Self.rotateHandleRadius * 2, height: Self.rotateHandleRadius * 2))
+        }
+        selectionLayer.path = path
+    }
+
+    private func scaleHandles(in box: CGRect) -> [CGPoint] {
+        let xs = [box.minX, box.midX, box.maxX]
+        let ys = [box.minY, box.midY, box.maxY]
+        var points: [CGPoint] = []
+        for x in xs {
+            for y in ys where x != box.midX || y != box.midY {
+                points.append(CGPoint(x: x, y: y))
+            }
+        }
+        return points
+    }
+
+    private func rotateHandles(in box: CGRect) -> [CGPoint] {
+        let d = Self.rotateOffset
+        let corners = [
+            CGPoint(x: box.minX, y: box.minY),
+            CGPoint(x: box.maxX, y: box.minY),
+            CGPoint(x: box.minX, y: box.maxY),
+            CGPoint(x: box.maxX, y: box.maxY),
+        ]
+        // Diagonal outward direction for each corner.
+        let dirs = [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1), CGPoint(x: -1, y: 1), CGPoint(x: 1, y: 1)]
+        return zip(corners, dirs).map { corner, dir in
+            let len = max(abs(dir.x), abs(dir.y))
+            let norm = CGPoint(x: dir.x / len, y: dir.y / len)
+            return CGPoint(x: corner.x + norm.x * d, y: corner.y + norm.y * d)
+        }
     }
 
     // MARK: - Rendering
-
-    private func updatePhotoContents() {
-        photoLayer.contents = image
-        needsLayout = true
-        updateHint()
-    }
-
-    private func applyTransform() {
-        let radians = edit.rotationDeg * .pi / 180
-        var t = CGAffineTransform.identity
-        t = t.translatedBy(x: edit.offsetX, y: edit.offsetY)
-        t = t.rotated(by: radians)
-        t = t.scaledBy(x: edit.scale, y: edit.scale)
-        photoLayer.setAffineTransform(t)
-    }
 
     private func updateHint() {
         if locked {
             hintLabel.stringValue = "Choose a paper size to unlock the canvas.\nThen add photos to begin."
             hintLabel.isHidden = false
-        } else if image == nil {
+        } else if compositedImage == nil {
             hintLabel.stringValue = "Drop photos here or use “Add photos…”"
             hintLabel.isHidden = false
         } else {
@@ -218,9 +354,7 @@ final class CanvasView: NSView {
         updateGlow()
     }
 
-    @objc private func windowKeyChanged() {
-        updateGlow()
-    }
+    @objc private func windowKeyChanged() { updateGlow() }
 
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
@@ -254,7 +388,7 @@ final class CanvasView: NSView {
         updateGlow()
     }
 
-    // MARK: - Mouse pan
+    // MARK: - Mouse (selection + layer-4 pan)
 
     override func mouseDown(with event: NSEvent) {
         if locked {
@@ -262,16 +396,57 @@ final class CanvasView: NSView {
             return
         }
         window?.makeFirstResponder(self)
-        lastDragPoint = convert(event.locationInWindow, from: nil)
+        let screenPoint = convert(event.locationInWindow, from: nil)
+        let canvas = canvasPoint(screenPoint)
+
+        // 1. Handle an existing selection (rotate / scale / move / deselect).
+        if let sel = selection {
+            if hitRotateHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
+                beginTransform(sel, mode: .rotate, start: canvas, option: event.modifierFlags.contains(.option))
+                return
+            }
+            if hitScaleHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) != nil {
+                beginTransform(sel, mode: .scale, start: canvas, option: event.modifierFlags.contains(.option))
+                return
+            }
+            if selectionBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+                beginTransform(sel, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
+                return
+            }
+            // Click outside → deselect, then fall through to layer-4 pan.
+            selection = nil
+        }
+
+        // 2. Select overlay (above photo) or watermark when clicked.
+        if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            selection = .overlay
+            beginTransform(.overlay, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
+            return
+        }
+        if !watermarkBox().isEmpty && watermarkBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            selection = .watermark
+            beginTransform(.watermark, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
+            return
+        }
+
+        // 3. Otherwise: layer-4 pan.
+        lastDragPoint = screenPoint
         beginGesture()
     }
 
     override func mouseDragged(with event: NSEvent) {
+        let screenPoint = convert(event.locationInWindow, from: nil)
+        let canvas = canvasPoint(screenPoint)
+
+        if let layer = transformGestureLayer {
+            applyTransformDrag(layer, canvas: canvas, commit: false)
+            return
+        }
+
         guard !locked, let last = lastDragPoint else { return }
-        let p = convert(event.locationInWindow, from: nil)
-        let dx = Double(p.x - last.x)
-        let dy = Double(p.y - last.y)
-        lastDragPoint = p
+        let dx = Double(screenPoint.x - last.x) / Double(screenScale())
+        let dy = Double(screenPoint.y - last.y) / Double(screenScale())
+        lastDragPoint = screenPoint
         var e = edit
         e.offsetX += dx
         e.offsetY += dy
@@ -279,6 +454,13 @@ final class CanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let layer = transformGestureLayer {
+            let canvas = canvasPoint(convert(event.locationInWindow, from: nil))
+            applyTransformDrag(layer, canvas: canvas, commit: true)
+            endTransform()
+            return
+        }
+
         guard !locked, lastDragPoint != nil else {
             super.mouseUp(with: event)
             return
@@ -287,9 +469,86 @@ final class CanvasView: NSView {
         applyEdit(edit, commit: true)
     }
 
-    /// Begin (or continue) one interaction gesture. The undo baseline is
-    /// captured once per gesture; 400ms of idle ends the gesture so the next
-    /// scroll or key event starts a fresh one.
+    // MARK: - Free-transform plumbing
+
+    private func beginTransform(_ layer: SelectedLayer, mode: TransformMode, start: CGPoint, option: Bool) {
+        transformGestureLayer = layer
+        transformGestureMode = mode
+        transformGestureStart = start
+        transformGestureOption = option
+        transformGestureStartWatermark = watermarkTransform
+        transformGestureStartOverlay = overlayTransform
+        beginGesture()
+    }
+
+    private func endTransform() {
+        transformGestureLayer = nil
+        transformGestureOption = false
+    }
+
+    private func applyTransformDrag(_ layer: SelectedLayer, canvas: CGPoint, commit: Bool) {
+        let dx = Double(canvas.x - transformGestureStart.x)
+        let dy = Double(canvas.y - transformGestureStart.y)
+
+        switch layer {
+        case .overlay:
+            var t = transformGestureStartOverlay
+            switch transformGestureMode {
+            case .move:
+                let s = Double(canvasOffsetScale())
+                t.offsetX += dx / s
+                t.offsetY += dy / s
+            case .scale:
+                let center = overlayBox().center
+                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
+                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
+                t.scale = min(Self.maxScale, max(Self.minScale, t.scale * (nowDist / startDist)))
+            case .rotate:
+                let center = overlayBox().center
+                let startAngle = atan2(Double(transformGestureStart.y - center.y), Double(transformGestureStart.x - center.x))
+                let nowAngle = atan2(Double(canvas.y - center.y), Double(canvas.x - center.x))
+                t.rotationDeg += (nowAngle - startAngle) * 180 / .pi
+            }
+            overlayTransform = t
+            onOverlayChanged?(t, commit, transformGestureOption)
+
+        case .watermark:
+            var t = transformGestureStartWatermark
+            switch transformGestureMode {
+            case .move:
+                t.offsetFractionX -= dx / Double(compositePixelSize.width)
+                t.offsetFractionY += dy / Double(compositePixelSize.height)
+            case .scale:
+                let center = watermarkBox().center
+                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
+                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
+                t.scale = min(Self.maxScale, max(Self.minScale, t.scale * (nowDist / startDist)))
+            case .rotate:
+                let center = watermarkBox().center
+                let startAngle = atan2(Double(transformGestureStart.y - center.y), Double(transformGestureStart.x - center.x))
+                let nowAngle = atan2(Double(canvas.y - center.y), Double(canvas.x - center.x))
+                t.rotationDeg += (nowAngle - startAngle) * 180 / .pi
+            }
+            watermarkTransform = t
+            onWatermarkChanged?(t, commit, transformGestureOption)
+        }
+        updateSelectionLayer()
+    }
+
+    private func hitRotateHandle(_ p: CGPoint, box: CGRect) -> Bool {
+        rotateHandles(in: box).contains { hypot($0.x - p.x, $0.y - p.y) <= Self.hitThreshold }
+    }
+
+    private func hitScaleHandle(_ p: CGPoint, box: CGRect) -> Int? {
+        let handles = scaleHandles(in: box)
+        for (i, h) in handles.enumerated() where hypot(h.x - p.x, h.y - p.y) <= Self.hitThreshold {
+            return i
+        }
+        return nil
+    }
+
+    // MARK: - Layer-4 gesture plumbing
+
     private func beginGesture() {
         if !gestureActive {
             gestureActive = true
@@ -301,9 +560,7 @@ final class CanvasView: NSView {
             self?.gestureEndWorkItem = nil
         }
         gestureEndWorkItem = item
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(Self.gestureIdleMs),
-            execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Self.gestureIdleMs), execute: item)
     }
 
     // MARK: - Scroll (zoom or R+rotate)
@@ -364,19 +621,19 @@ final class CanvasView: NSView {
         let cmd = event.modifierFlags.contains(.command)
         let shift = event.modifierFlags.contains(.shift)
         switch event.keyCode {
-        case 123: nudge(dx: shift ? -10 : -1, dy: 0)       // left arrow
-        case 124: nudge(dx: shift ? 10 : 1, dy: 0)         // right arrow
-        case 126: nudge(dx: 0, dy: shift ? 10 : 1)         // up arrow
-        case 125: nudge(dx: 0, dy: shift ? -10 : -1)       // down arrow
-        case 49:                                            // space
+        case 123: nudge(dx: shift ? -10 : -1, dy: 0)
+        case 124: nudge(dx: shift ? 10 : 1, dy: 0)
+        case 126: nudge(dx: 0, dy: shift ? 10 : 1)
+        case 125: nudge(dx: 0, dy: shift ? -10 : -1)
+        case 49:
             if !event.isARepeat { handleSpace() }
-        case 6:                                            // z
+        case 6:
             if cmd {
                 if shift { onRedo?() } else { onUndo?() }
             } else {
                 super.keyDown(with: event)
             }
-        case 15: isRDown = true                            // r
+        case 15: isRDown = true
         default:
             super.keyDown(with: event)
         }
@@ -400,7 +657,6 @@ final class CanvasView: NSView {
         applyEdit(e, commit: true)
     }
 
-    /// Canvas points per export pixel (for export-pixel nudges).
     private func pointPerExportPixel() -> Double {
         let rect = paperRect()
         guard let px = paperPixelSize, px.width > 0, rect.width > 0 else { return 1 }
@@ -471,6 +727,22 @@ final class CanvasView: NSView {
     }
 }
 
+extension SelectedLayer {
+    var layerNumber: Int {
+        switch self {
+        case .watermark: return 1
+        case .overlay: return 3
+        }
+    }
+}
+
 extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
+
+    func toScreen(scale: CGFloat, paper: CGRect) -> CGRect {
+        CGRect(x: paper.minX + minX * scale,
+               y: paper.minY + minY * scale,
+               width: width * scale,
+               height: height * scale)
+    }
 }

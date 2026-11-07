@@ -8,6 +8,9 @@ final class SectionView: NSView {
     private(set) var isVisible = true
     private(set) var isExpanded = true
 
+    /// Called after the eye toggle changes, with the new visibility state.
+    var onEyeToggle: ((Bool) -> Void)?
+
     private let headerView = NSView()
     private let disclosureButton = NSButton()
     private let eyeButton = NSButton()
@@ -143,6 +146,14 @@ final class SectionView: NSView {
 
     @objc private func toggleVisibility() {
         isVisible.toggle()
+        updateEyeIcon()
+        onEyeToggle?(isVisible)
+    }
+
+    /// Programmatically set the eye state without firing `onEyeToggle`.
+    func setVisible(_ visible: Bool) {
+        guard isVisible != visible else { return }
+        isVisible = visible
         updateEyeIcon()
     }
 }

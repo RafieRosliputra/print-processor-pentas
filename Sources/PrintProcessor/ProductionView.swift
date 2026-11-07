@@ -1,6 +1,9 @@
 import AppKit
 import PrintProcessorCore
 import UniformTypeIdentifiers
+import Quartz
+import CoreGraphics
+import ImageIO
 
 /// Production tab: canvas on the left, scrollable options panel on the right,
 /// and a top-right bar with paper-size buttons + Process.
@@ -90,6 +93,22 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var orientationButton: NSButton?
     private var rotationField: RotationStepField?
 
+    // Export UI + state.
+    private var exportJPGCheckbox: NSButton?
+    private var exportWebPCheckbox: NSButton?
+    private var jpgQualityField: NSTextField?
+    private var jpgSizingPopup: NSPopUpButton?
+    private var jpgLongEdgeField: NSTextField?
+    private var webpQualityField: NSTextField?
+    private var webpLongEdgeField: NSTextField?
+    private var exportRootLabel: NSTextField?
+    private var exportRoot: URL?
+    private var exportJob: ExportJob?
+    private var applyAllCollisionPolicy: CollisionPolicy?
+    private var renderButton: NSButton?
+    private var quickLookURL: URL?
+    private var spaceCloseMonitor: Any?
+
     private static let lastSizeKey = "com.johorstudio.printprocessor.lastPaperSize"
     private static let lastFolderKey = "com.johorstudio.printprocessor.lastWorkingFolder"
 
@@ -141,6 +160,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
         if let observer = settingsObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        if let monitor = spaceCloseMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        deleteQuickLookTemp()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -272,17 +295,42 @@ final class ProductionView: NSView, NSTextViewDelegate {
         canvasView.onMiddleClick = { [weak self] layer in
             self?.handleMiddleClick(layer)
         }
+        canvasView.onRender = { [weak self] in self?.renderClicked() }
+        canvasView.onProcess = { [weak self] in self?.processClicked() }
 
         let options = makeOptionsPanel()
 
-        row.addSubview(canvasView)
+        // Left column: canvas above a Render button.
+        let left = NSView()
+        left.translatesAutoresizingMaskIntoConstraints = false
+        canvasView.translatesAutoresizingMaskIntoConstraints = false
+
+        let renderButton = NSButton(title: "Render", target: self, action: #selector(renderClicked))
+        renderButton.bezelStyle = .rounded
+        renderButton.controlSize = .regular
+        renderButton.toolTip = "Render — render the current image at full resolution into a temp file and open Quick Look (Space closes). Shortcut: ⌘R"
+        renderButton.translatesAutoresizingMaskIntoConstraints = false
+        self.renderButton = renderButton
+
+        left.addSubview(canvasView)
+        left.addSubview(renderButton)
+        row.addSubview(left)
         row.addSubview(options)
 
         NSLayoutConstraint.activate([
-            canvasView.topAnchor.constraint(equalTo: row.topAnchor),
-            canvasView.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            canvasView.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            canvasView.trailingAnchor.constraint(equalTo: options.leadingAnchor),
+            left.topAnchor.constraint(equalTo: row.topAnchor),
+            left.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            left.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            left.trailingAnchor.constraint(equalTo: options.leadingAnchor),
+
+            canvasView.topAnchor.constraint(equalTo: left.topAnchor),
+            canvasView.leadingAnchor.constraint(equalTo: left.leadingAnchor),
+            canvasView.trailingAnchor.constraint(equalTo: left.trailingAnchor),
+
+            renderButton.topAnchor.constraint(equalTo: canvasView.bottomAnchor, constant: 6),
+            renderButton.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 12),
+            renderButton.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -8),
+            renderButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 90),
 
             options.topAnchor.constraint(equalTo: row.topAnchor),
             options.trailingAnchor.constraint(equalTo: row.trailingAnchor),
@@ -304,6 +352,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
+        let exportSection = SectionView(title: "Export", body: makeExportBody())
         let watermarkSection = SectionView(title: "Watermark", body: makeWatermarkBody())
         let psdSection = SectionView(title: "PSD Text", body: makePSDTextBody())
         let overlaySection = SectionView(title: "Overlay", body: makeOverlayBody())
@@ -323,7 +372,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         sections = [1: watermarkSection, 2: psdSection, 3: overlaySection, 0: gradientSection,
                     4: photoSection, 5: bg5Section, 6: bg6Section]
 
-        for section in [watermarkSection, psdSection, overlaySection, gradientSection, photoSection, bg5Section, bg6Section] {
+        for section in [exportSection, watermarkSection, psdSection, overlaySection, gradientSection, photoSection, bg5Section, bg6Section] {
             stack.addArrangedSubview(section)
             section.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
@@ -352,6 +401,184 @@ final class ProductionView: NSView, NSTextViewDelegate {
     }
 
     // MARK: - Section bodies
+
+    private func makeNumberField() -> NSTextField {
+        let field = NSTextField(string: "")
+        field.isEditable = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
+        field.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        field.alignment = .left
+        return field
+    }
+
+    private func makeExportBody() -> NSView {
+        let jpgCheck = NSButton(checkboxWithTitle: "JPG", target: self, action: #selector(exportJPGToggled))
+        jpgCheck.toolTip = "JPG — export JPG files into JPG/"
+        exportJPGCheckbox = jpgCheck
+
+        let webpCheck = NSButton(checkboxWithTitle: "WebP", target: self, action: #selector(exportWebPToggled))
+        webpCheck.toolTip = "WebP — export WebP files into WebP/"
+        exportWebPCheckbox = webpCheck
+
+        let formatsRow = NSStackView(views: [jpgCheck, webpCheck])
+        formatsRow.orientation = .horizontal
+        formatsRow.alignment = .centerY
+        formatsRow.spacing = 18
+
+        let jpgHeader = makeLabel("JPG", size: 12, weight: .semibold, color: .labelColor)
+        let webpHeader = makeLabel("WebP", size: 12, weight: .semibold, color: .labelColor)
+
+        let jpgQuality = makeNumberField()
+        jpgQuality.target = self
+        jpgQuality.action = #selector(exportJPGQualityChanged)
+        jpgQuality.toolTip = "JPG quality — Photoshop scale 0–12 (default 10)"
+        jpgQualityField = jpgQuality
+        jpgQuality.widthAnchor.constraint(equalToConstant: 60).isActive = true
+
+        let sizingPopup = NSPopUpButton()
+        for s in JPGSizing.allCases { sizingPopup.addItem(withTitle: s.displayName) }
+        sizingPopup.target = self
+        sizingPopup.action = #selector(exportJPGSizingChanged)
+        sizingPopup.toolTip = "JPG size — inch (300 dpi) or long edge in pixels"
+        jpgSizingPopup = sizingPopup
+
+        let jpgLongEdge = makeNumberField()
+        jpgLongEdge.target = self
+        jpgLongEdge.action = #selector(exportJPGLongEdgeChanged)
+        jpgLongEdge.toolTip = "JPG long edge — pixels when “Long edge (px)” is selected"
+        jpgLongEdgeField = jpgLongEdge
+        jpgLongEdge.widthAnchor.constraint(equalToConstant: 70).isActive = true
+
+        let webpQuality = makeNumberField()
+        webpQuality.target = self
+        webpQuality.action = #selector(exportWebPQualityChanged)
+        webpQuality.toolTip = "WebP quality — percentage 0–100 (default 50)"
+        webpQualityField = webpQuality
+        webpQuality.widthAnchor.constraint(equalToConstant: 60).isActive = true
+
+        let webpLongEdge = makeNumberField()
+        webpLongEdge.target = self
+        webpLongEdge.action = #selector(exportWebPLongEdgeChanged)
+        webpLongEdge.toolTip = "WebP long edge — pixels (0 = full paper size at 300 dpi)"
+        webpLongEdgeField = webpLongEdge
+        webpLongEdge.widthAnchor.constraint(equalToConstant: 70).isActive = true
+
+        let exportToButton = NSButton(title: "Export to…", target: self, action: #selector(chooseExportRoot))
+        exportToButton.bezelStyle = .rounded
+        exportToButton.controlSize = .regular
+        exportToButton.toolTip = "Export to… — choose the export root folder (default = working folder); JPG/ and WebP/ are created inside"
+
+        let rootLabel = makeLabel("Working folder", size: 11, weight: .regular, color: .dimText)
+        rootLabel.lineBreakMode = .byTruncatingMiddle
+        rootLabel.maximumNumberOfLines = 1
+        exportRootLabel = rootLabel
+
+        let stack = NSStackView(views: [
+            formatsRow,
+            jpgHeader,
+            labelRow("Quality", jpgQuality),
+            labelRow("Size", sizingPopup),
+            labelRow("Long edge", jpgLongEdge),
+            webpHeader,
+            labelRow("Quality", webpQuality),
+            labelRow("Long edge", webpLongEdge),
+            exportToButton,
+            rootLabel,
+        ])
+        rootLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -14).isActive = true
+
+        let container = makeBody(stack)
+        syncExportUI()
+        return container
+    }
+
+    // MARK: - Export UI sync / actions
+
+    private func readExportUI() -> ExportSettings {
+        var e = settings.export
+        e.exportJPG = exportJPGCheckbox?.state == .on
+        e.exportWebP = exportWebPCheckbox?.state == .on
+        if let v = Int(jpgQualityField?.stringValue ?? "") { e.jpgQuality = v }
+        if let idx = jpgSizingPopup?.indexOfSelectedItem, JPGSizing.allCases.indices.contains(idx) {
+            e.jpgSizing = JPGSizing.allCases[idx]
+        }
+        if let v = Int(jpgLongEdgeField?.stringValue ?? "") { e.jpgLongEdge = v }
+        if let v = Int(webpQualityField?.stringValue ?? "") { e.webpQuality = v }
+        if let v = Int(webpLongEdgeField?.stringValue ?? "") { e.webpLongEdge = v }
+        return e
+    }
+
+    private func syncExportUI() {
+        let e = settings.export
+        exportJPGCheckbox?.state = e.exportJPG ? .on : .off
+        exportWebPCheckbox?.state = e.exportWebP ? .on : .off
+        jpgQualityField?.stringValue = String(e.jpgQuality)
+        jpgLongEdgeField?.stringValue = String(e.jpgLongEdge)
+        webpQualityField?.stringValue = String(e.webpQuality)
+        webpLongEdgeField?.stringValue = String(e.webpLongEdge)
+        if let idx = JPGSizing.allCases.firstIndex(of: e.jpgSizing) {
+            jpgSizingPopup?.selectItem(at: idx)
+        }
+        exportRootLabel?.stringValue = exportRoot?.path ?? "Working folder"
+        let longEdgeMode = e.jpgSizing == .longEdge
+        jpgLongEdgeField?.isEnabled = longEdgeMode
+    }
+
+    private func updateExportSetting(_ mutate: (inout ExportSettings) -> Void) {
+        var s = AppSettings.load()
+        mutate(&s.export)
+        s.save()
+        settings = s
+        syncExportUI()
+    }
+
+    @objc private func exportJPGToggled() {
+        updateExportSetting { $0.exportJPG = self.exportJPGCheckbox?.state == .on }
+    }
+
+    @objc private func exportWebPToggled() {
+        updateExportSetting { $0.exportWebP = self.exportWebPCheckbox?.state == .on }
+    }
+
+    @objc private func exportJPGQualityChanged() {
+        guard let v = Int(jpgQualityField?.stringValue ?? "") else { return }
+        updateExportSetting { $0.jpgQuality = min(12, max(0, v)) }
+    }
+
+    @objc private func exportJPGLongEdgeChanged() {
+        guard let v = Int(jpgLongEdgeField?.stringValue ?? "") else { return }
+        updateExportSetting { $0.jpgLongEdge = max(0, v) }
+    }
+
+    @objc private func exportJPGSizingChanged() {
+        guard let idx = jpgSizingPopup?.indexOfSelectedItem, JPGSizing.allCases.indices.contains(idx) else { return }
+        updateExportSetting { $0.jpgSizing = JPGSizing.allCases[idx] }
+    }
+
+    @objc private func exportWebPQualityChanged() {
+        guard let v = Int(webpQualityField?.stringValue ?? "") else { return }
+        updateExportSetting { $0.webpQuality = min(100, max(0, v)) }
+    }
+
+    @objc private func exportWebPLongEdgeChanged() {
+        guard let v = Int(webpLongEdgeField?.stringValue ?? "") else { return }
+        updateExportSetting { $0.webpLongEdge = max(0, v) }
+    }
+
+    @objc private func chooseExportRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose the export root folder. JPG/ and WebP/ are created inside it."
+        if panel.runModal() == .OK, let url = panel.url {
+            exportRoot = url
+            exportRootLabel?.stringValue = url.path
+        }
+    }
 
     private func makeWatermarkBody() -> NSView {
         let textField = NSTextField()
@@ -1180,10 +1407,226 @@ final class ProductionView: NSView, NSTextViewDelegate {
             statusLabel.stringValue = "Select a paper size first."
             return
         }
+        guard !files.isEmpty else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Add photos first."
+            return
+        }
+        if exportJob?.isRunning == true {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Export already running."
+            return
+        }
+
+        let export = readExportUI()
+        guard export.exportJPG || export.exportWebP else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Choose JPG and/or WebP."
+            return
+        }
+
+        var formats: [ExportFormat] = []
+        if export.exportJPG { formats.append(.jpg) }
+        if export.exportWebP { formats.append(.webp) }
+        applyAllCollisionPolicy = nil
+
+        let root = exportRoot ?? (workingFolder ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+        let canvas = canvasPixelSize()
+        guard canvas.width > 0, canvas.height > 0 else { return }
+
+        // Snapshot everything the parallel render needs off the main thread.
+        let project = makeProjectModel()
+        let layer2Image = compositor.layer2Image
+        let layer2Box = layerSettings.psdText.box
+        let layer2Align = layerSettings.psdText.align
+        let scanMode = settings.scanMode
+        let cache = imageCache
+        let fileURLs = files
+
+        let job = ExportJob(
+            files: fileURLs,
+            formats: formats,
+            exportRoot: root,
+            settings: export,
+            paperPixelSize: canvas,
+            sizeLabel: size.label,
+            cwebpPath: settings.cwebpPath,
+            cpuLimit: settings.cpuLimit,
+            render: { index, canvasSize in
+                guard fileURLs.indices.contains(index) else { return nil }
+                guard let original = cache.loadOriginal(url: fileURLs[index]) else { return nil }
+                let c = Compositor()
+                c.layer2Image = layer2Image
+                c.layer2Box = layer2Box
+                c.layer2Align = layer2Align
+                c.scanMode = scanMode
+                return c.render(project: project, imageIndex: index, canvasPixelSize: canvasSize,
+                                photoSource: { _ in original })
+            }
+        )
+
+        // Resolve every collision before any work starts.
+        var resolutions: [URL: CollisionPolicy] = [:]
+        for item in job.plan() {
+            if item.jpgExists, let u = item.jpgURL {
+                resolutions[u] = resolveCollision(for: u)
+            }
+            if item.webpExists, let u = item.webpURL {
+                resolutions[u] = resolveCollision(for: u)
+            }
+        }
+
+        exportJob = job
+        job.onProgress = { [weak self] progress in
+            self?.updateExportProgress(progress)
+        }
+        job.run(resolutions: resolutions) { [weak self] summary in
+            self?.finishExport(summary)
+        }
+    }
+
+    /// Ask the user how to handle an existing output file. The NSAlert carries a
+    /// suppression checkbox so "apply to all" reuses the chosen policy.
+    private func resolveCollision(for url: URL) -> CollisionPolicy {
+        if let applied = applyAllCollisionPolicy {
+            return applied
+        }
+        let alert = NSAlert()
+        alert.messageText = "File already exists"
+        alert.informativeText = "“\(url.lastPathComponent)” already exists in \(url.deletingLastPathComponent().lastPathComponent)/. What should the export do?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Replace")
+        alert.addButton(withTitle: "Skip")
+        alert.addButton(withTitle: "Keep both")
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Apply to all"
+        let response = alert.runModal()
+        let policy: CollisionPolicy
+        switch response {
+        case .alertFirstButtonReturn: policy = .replace
+        case .alertSecondButtonReturn: policy = .skip
+        case .alertThirdButtonReturn: policy = .keepBoth
+        default: policy = .skip
+        }
+        if alert.suppressionButton?.state == .on {
+            applyAllCollisionPolicy = policy
+        }
+        return applyAllCollisionPolicy ?? policy
+    }
+
+    private func updateExportProgress(_ progress: ExportProgress) {
         statusLabel.textColor = .dimText
-        statusLabel.stringValue = "Processing \(size.label)…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.updateStatus()
+        var parts: [String] = []
+        if progress.jpgTotal > 0 {
+            parts.append("JPG – \(progress.jpgDone)/\(progress.jpgTotal)")
+        }
+        if progress.webpTotal > 0 {
+            parts.append("WebP – \(progress.webpDone)/\(progress.webpTotal)")
+        }
+        statusLabel.stringValue = parts.isEmpty ? "Exporting…" : parts.joined(separator: " · ")
+    }
+
+    private func finishExport(_ summary: ExportSummary) {
+        exportJob = nil
+        var parts: [String] = []
+        if summary.jpgWritten > 0 || settings.export.exportJPG {
+            parts.append("JPG – \(summary.jpgWritten) files")
+        }
+        if summary.webpWritten > 0 || settings.export.exportWebP {
+            parts.append("WebP – \(summary.webpWritten) files")
+        }
+        if summary.failed > 0 {
+            statusLabel.textColor = .systemRed
+            parts.append("\(summary.failed) failed")
+        } else if summary.cancelled {
+            statusLabel.textColor = .systemRed
+            parts.append("cancelled")
+        } else {
+            statusLabel.textColor = .dimText
+        }
+        statusLabel.stringValue = parts.isEmpty ? "Nothing exported" : parts.joined(separator: " / ")
+    }
+
+    // MARK: - Render / Quick Look
+
+    @objc private func renderClicked() {
+        guard let url = currentFileURL(), selectedSize != nil else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Select a paper size and a photo first."
+            return
+        }
+        let canvas = canvasPixelSize()
+        guard canvas.width > 0, canvas.height > 0 else { return }
+
+        statusLabel.textColor = .dimText
+        statusLabel.stringValue = "Rendering…"
+
+        let project = makeProjectModel()
+        let layer2Image = compositor.layer2Image
+        let layer2Box = layerSettings.psdText.box
+        let layer2Align = layerSettings.psdText.align
+        let scanMode = settings.scanMode
+        let cache = imageCache
+        let index = currentIndex
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let original = cache.loadOriginal(url: url)
+            let c = Compositor()
+            c.layer2Image = layer2Image
+            c.layer2Box = layer2Box
+            c.layer2Align = layer2Align
+            c.scanMode = scanMode
+            guard let image = c.render(project: project, imageIndex: index, canvasPixelSize: canvas,
+                                       photoSource: { _ in original }) else {
+                DispatchQueue.main.async {
+                    self.statusLabel.textColor = .systemRed
+                    self.statusLabel.stringValue = "Render failed."
+                }
+                return
+            }
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("pp-render-\(UUID().uuidString).png")
+            guard let dest = CGImageDestinationCreateWithURL(tmp as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(dest, image, nil)
+            guard CGImageDestinationFinalize(dest) else { return }
+            DispatchQueue.main.async {
+                self.statusLabel.textColor = .dimText
+                self.statusLabel.stringValue = "Quick Look — press Space to close."
+                self.presentQuickLook(tmp)
+            }
+        }
+    }
+
+    private func presentQuickLook(_ url: URL) {
+        deleteQuickLookTemp()
+        quickLookURL = url
+        installSpaceCloseMonitor()
+        if let panel = QLPreviewPanel.shared() {
+            panel.dataSource = self
+            panel.delegate = self
+            panel.makeKeyAndOrderFront(nil)
+            panel.reloadData()
+        }
+    }
+
+    private func deleteQuickLookTemp() {
+        if let url = quickLookURL {
+            try? FileManager.default.removeItem(at: url)
+            quickLookURL = nil
+        }
+    }
+
+    private func installSpaceCloseMonitor() {
+        if spaceCloseMonitor == nil {
+            spaceCloseMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self = self,
+                      event.keyCode == 49,
+                      let panel = QLPreviewPanel.shared(), panel.isVisible else { return event }
+                panel.orderOut(nil)
+                self.deleteQuickLookTemp()
+                return nil
+            }
         }
     }
 
@@ -1599,6 +2042,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         imageCache.setRAMCap(bytes: settings.cacheRAMCapMB * 1024 * 1024)
         refreshRotationField()
         reloadScanModes()
+        syncExportUI()
         scheduleLayer2Render()
     }
 
@@ -1774,5 +2218,34 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func colorFromRGB(_ c: RGBAColor) -> NSColor {
         NSColor(srgbRed: CGFloat(c.red), green: CGFloat(c.green), blue: CGFloat(c.blue), alpha: CGFloat(c.alpha))
+    }
+}
+
+// MARK: - Quick Look
+
+extension ProductionView: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        true
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+        panel.delegate = self
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        deleteQuickLookTemp()
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        quickLookURL != nil ? 1 : 0
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        quickLookURL as NSURL?
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!) -> NSRect {
+        window?.frame ?? .zero
     }
 }

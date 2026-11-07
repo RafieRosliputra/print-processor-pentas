@@ -43,6 +43,10 @@ public struct AppSettings: Codable, Equatable {
     public var cacheRAMCapMB: Int
     /// Project JSON autosave interval in seconds.
     public var autosaveSeconds: Int
+    /// Export defaults (formats, quality, sizing, filename pattern).
+    public var export: ExportSettings
+    /// CPU-core limit for the export queue (0 = all cores).
+    public var cpuLimit: Int
 
     public static let defaults = AppSettings(
         doubleTapMs: 300,
@@ -58,7 +62,9 @@ public struct AppSettings: Codable, Equatable {
         photoshopPath: "",
         cwebpPath: "",
         cacheRAMCapMB: 1536,
-        autosaveSeconds: 3
+        autosaveSeconds: 3,
+        export: .defaults,
+        cpuLimit: 0
     )
 
     public init(
@@ -75,7 +81,9 @@ public struct AppSettings: Codable, Equatable {
         photoshopPath: String = "",
         cwebpPath: String = "",
         cacheRAMCapMB: Int = 1536,
-        autosaveSeconds: Int = 3
+        autosaveSeconds: Int = 3,
+        export: ExportSettings = .defaults,
+        cpuLimit: Int = 0
     ) {
         self.doubleTapMs = doubleTapMs
         self.rotateStep = rotateStep
@@ -91,6 +99,8 @@ public struct AppSettings: Codable, Equatable {
         self.cwebpPath = cwebpPath
         self.cacheRAMCapMB = max(1, cacheRAMCapMB)
         self.autosaveSeconds = max(1, autosaveSeconds)
+        self.export = export
+        self.cpuLimit = max(0, cpuLimit)
     }
 
     // MARK: - Codable (backward-compatible: new keys are optional on decode)
@@ -99,7 +109,7 @@ public struct AppSettings: Codable, Equatable {
         case doubleTapMs, rotateStep, scrollZoomSpeed, scrollRotateSpeed
         case nudgeBasis, tooltipDelay, scanMode, savedScanModes
         case psdTextLayerName, minTextScale, photoshopPath, cwebpPath
-        case cacheRAMCapMB, autosaveSeconds
+        case cacheRAMCapMB, autosaveSeconds, export, cpuLimit
     }
 
     public init(from decoder: Decoder) throws {
@@ -118,6 +128,8 @@ public struct AppSettings: Codable, Equatable {
         cwebpPath = try c.decodeIfPresent(String.self, forKey: .cwebpPath) ?? ""
         cacheRAMCapMB = try c.decodeIfPresent(Int.self, forKey: .cacheRAMCapMB) ?? 1536
         autosaveSeconds = try c.decodeIfPresent(Int.self, forKey: .autosaveSeconds) ?? 3
+        export = try c.decodeIfPresent(ExportSettings.self, forKey: .export) ?? .defaults
+        cpuLimit = try c.decodeIfPresent(Int.self, forKey: .cpuLimit) ?? 0
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -136,6 +148,8 @@ public struct AppSettings: Codable, Equatable {
         try c.encode(cwebpPath, forKey: .cwebpPath)
         try c.encode(cacheRAMCapMB, forKey: .cacheRAMCapMB)
         try c.encode(autosaveSeconds, forKey: .autosaveSeconds)
+        try c.encode(export, forKey: .export)
+        try c.encode(cpuLimit, forKey: .cpuLimit)
     }
 
     private static let storageKey = "com.johorstudio.printprocessor.AppSettings"

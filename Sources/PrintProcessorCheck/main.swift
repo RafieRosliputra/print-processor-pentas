@@ -470,6 +470,182 @@ do {
     check(FileManager.default.fileExists(atPath: other.path), "Unrelated dirs untouched")
 }
 
+// MARK: - Milestone 5 additions (SPEC §10–§12 export + shortcuts)
+
+func exportIntProp(_ props: [CFString: Any]?, _ key: CFString) -> Int {
+    guard let v = props?[key] else { return 0 }
+    return (v as? NSNumber)?.intValue ?? (v as? Int) ?? 0
+}
+
+/// Run a JPG-only export to completion, spinning the main run loop so the
+/// ExportJob's main-queue completion can fire.
+func runExportSync(
+    files: [URL],
+    root: URL,
+    paper: CGSize,
+    resolutions: [URL: CollisionPolicy] = [:],
+    pattern: String = "{name}"
+) -> ExportSummary {
+    let settings = ExportSettings(exportJPG: true, exportWebP: false, filenamePattern: pattern)
+    let job = ExportJob(
+        files: files,
+        formats: [.jpg],
+        exportRoot: root,
+        settings: settings,
+        paperPixelSize: paper,
+        sizeLabel: "4x6",
+        cwebpPath: "",
+        cpuLimit: 0,
+        render: { i, canvas in
+            guard files.indices.contains(i) else { return nil }
+            return makeSolidImage(width: Int(canvas.width), height: Int(canvas.height), r: 1, g: 1, b: 1, a: 1)
+        }
+    )
+    var summary = ExportSummary()
+    var done = false
+    job.run(resolutions: resolutions) { s in summary = s; done = true }
+    let deadline = Date().addingTimeInterval(30)
+    while !done && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    return summary
+}
+
+// 1. Filename pattern expansion.
+do {
+    let a = ExportNaming.fileName(sourceName: "122 - Norman Hakim.jpg", pattern: "{name}", sizeLabel: "4x6", index: 0, format: .jpg)
+    check(a == "122 - Norman Hakim.jpg", "pattern {name} -> \"\(a)\"")
+
+    let b = ExportNaming.fileName(sourceName: "122 - Norman Hakim.jpg", pattern: "{name}_{size}", sizeLabel: "4x6", index: 0, format: .jpg)
+    check(b == "122 - Norman Hakim_4x6.jpg", "pattern {name}_{size} -> \"\(b)\"")
+
+    let c = ExportNaming.fileName(sourceName: "01.jpg", pattern: "{number}", sizeLabel: "4x6", index: 0, format: .webp)
+    check(c == "01.webp", "pattern {number} -> \"\(c)\"")
+
+    let d = ExportNaming.fileName(sourceName: "a.jpg", pattern: "{index}", sizeLabel: "4x6", index: 2, format: .jpg)
+    check(d == "3.jpg", "pattern {index} (1-based) -> \"\(d)\"")
+}
+
+// 2. Keep-both naming never overwrites.
+do {
+    let tmp = makeTempDir("uniq")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let base = URL(fileURLWithPath: tmp).appendingPathComponent("photo.jpg")
+    makeFile(base.path, [1])
+    let u1 = ExportNaming.uniqueURL(base)
+    check(u1.lastPathComponent == "photo-1.jpg", "uniqueURL -> photo-1.jpg (got \(u1.lastPathComponent))")
+    makeFile(u1.path, [1])
+    let u2 = ExportNaming.uniqueURL(base)
+    check(u2.lastPathComponent == "photo-2.jpg", "uniqueURL -> photo-2.jpg (got \(u2.lastPathComponent))")
+}
+
+// 3. JPEG: dpi 300, sRGB, no EXIF, paper pixels.
+do {
+    let tmp = makeTempDir("jpg")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let img = makeSolidImage(width: 1200, height: 1800, r: 1, g: 0, b: 0, a: 1)!
+    let url = URL(fileURLWithPath: tmp).appendingPathComponent("out.jpg")
+    check(JPEGWriter.write(img, to: url, quality: 10), "JPEGWriter writes a JPG")
+    let src = CGImageSourceCreateWithURL(url as CFURL, nil)
+    let props = src.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) } as? [CFString: Any]
+    check(exportIntProp(props, kCGImagePropertyDPIWidth) == 300
+          && exportIntProp(props, kCGImagePropertyDPIHeight) == 300,
+          "JPG dpi 300 (got \(exportIntProp(props, kCGImagePropertyDPIWidth))x\(exportIntProp(props, kCGImagePropertyDPIHeight)))")
+    let colorModel = props?[kCGImagePropertyColorModel] as? String ?? ""
+    check(colorModel.contains("RGB"), "JPG sRGB colour model (got \"\(colorModel)\")")
+    let profileName = props?[kCGImagePropertyProfileName] as? String ?? ""
+    check(profileName.contains("sRGB"), "JPG sRGB profile embedded (got \"\(profileName)\")")
+    // Source metadata is never carried over (fresh render); ImageIO still writes
+    // a minimal dimension/colorspace EXIF, so we assert the meaningful fields are
+    // absent rather than requiring a literally empty dictionary.
+    check(props?[kCGImagePropertyGPSDictionary] == nil, "JPG has no GPS metadata")
+    let tiff = props?[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+    let stripped = (tiff?[kCGImagePropertyTIFFMake] == nil)
+        && (tiff?[kCGImagePropertyTIFFSoftware] == nil)
+        && (tiff?[kCGImagePropertyTIFFCopyright] == nil)
+    check(stripped, "JPG stripped of camera/software/copyright metadata")
+    let decoded = src.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+    check(decoded?.width == 1200 && decoded?.height == 1800,
+          "JPG size = paper pixels (got \(decoded?.width ?? 0)x\(decoded?.height ?? 0))")
+}
+
+// 4. Parallel export of 8 files; every output exists.
+do {
+    let tmp = makeTempDir("export8")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    var files: [URL] = []
+    for i in 0..<8 {
+        let u = URL(fileURLWithPath: tmp).appendingPathComponent("\(i).png")
+        _ = writePNG(makeSolidImage(width: 60, height: 90, r: 0, g: 0, b: 1, a: 1)!, to: u)
+        files.append(u)
+    }
+    let summary = runExportSync(files: files, root: URL(fileURLWithPath: tmp), paper: CGSize(width: 120, height: 180))
+    check(summary.jpgWritten == 8, "parallel export wrote 8 JPGs (got \(summary.jpgWritten))")
+    var all = true
+    for i in 0..<8 {
+        let u = URL(fileURLWithPath: tmp).appendingPathComponent("JPG").appendingPathComponent("\(i).jpg")
+        if !FileManager.default.fileExists(atPath: u.path) { all = false }
+    }
+    check(all, "all 8 exported JPG files exist in JPG/")
+}
+
+// 5. Collision policy: replace / skip / keep both.
+do {
+    let tmp = makeTempDir("collision")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let src = URL(fileURLWithPath: tmp).appendingPathComponent("a.png")
+    _ = writePNG(makeSolidImage(width: 20, height: 20, r: 0, g: 1, b: 0, a: 1)!, to: src)
+    let out = URL(fileURLWithPath: tmp).appendingPathComponent("JPG").appendingPathComponent("a.jpg")
+
+    let first = runExportSync(files: [src], root: URL(fileURLWithPath: tmp), paper: CGSize(width: 40, height: 40))
+    check(first.jpgWritten == 1 && FileManager.default.fileExists(atPath: out.path), "first export writes a.jpg")
+
+    // keep both -> a-1.jpg, original untouched.
+    let keep = runExportSync(files: [src], root: URL(fileURLWithPath: tmp), paper: CGSize(width: 40, height: 40), resolutions: [out: .keepBoth])
+    let keepURL = URL(fileURLWithPath: tmp).appendingPathComponent("JPG").appendingPathComponent("a-1.jpg")
+    check(keep.jpgWritten == 1 && FileManager.default.fileExists(atPath: keepURL.path), "keepBoth writes a-1.jpg")
+
+    // skip -> no extra file.
+    _ = runExportSync(files: [src], root: URL(fileURLWithPath: tmp), paper: CGSize(width: 40, height: 40), resolutions: [out: .skip])
+    let skipURL = URL(fileURLWithPath: tmp).appendingPathComponent("JPG").appendingPathComponent("a-2.jpg")
+    check(!FileManager.default.fileExists(atPath: skipURL.path), "skip writes nothing new")
+}
+
+// 6. WebP long-edge + quality (only when cwebp is present).
+if WebPEncoder.isAvailable {
+    let tmp = makeTempDir("webpexport")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let settings = ExportSettings(exportJPG: false, exportWebP: true, webpQuality: 70, webpLongEdge: 160)
+    let job = ExportJob(
+        files: [URL(fileURLWithPath: tmp).appendingPathComponent("x.png")],
+        formats: [.webp],
+        exportRoot: URL(fileURLWithPath: tmp),
+        settings: settings,
+        paperPixelSize: CGSize(width: 400, height: 600),
+        sizeLabel: "4x6",
+        cwebpPath: "",
+        cpuLimit: 0,
+        render: { _, canvas in makeSolidImage(width: Int(canvas.width), height: Int(canvas.height), r: 0, g: 0, b: 1, a: 1) }
+    )
+    var summary = ExportSummary()
+    var done = false
+    job.run(resolutions: [:]) { s in summary = s; done = true }
+    let deadline = Date().addingTimeInterval(30)
+    while !done && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    let out = URL(fileURLWithPath: tmp).appendingPathComponent("WebP").appendingPathComponent("x.webp")
+    check(summary.webpWritten == 1 && FileManager.default.fileExists(atPath: out.path), "WebP export writes x.webp")
+    if let src = CGImageSourceCreateWithURL(out as CFURL, nil),
+       let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+        check(max(img.width, img.height) == 160, "WebP long edge == 160 (got \(max(img.width, img.height)))")
+    } else {
+        check(false, "WebP decodes for long-edge check")
+    }
+} else {
+    print("[skip] cwebp not found — WebP export check skipped")
+}
+
 if failures == 0 {
     print("PrintProcessorCheck: PASS")
     exit(0)

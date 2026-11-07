@@ -16,6 +16,15 @@ final class SettingsView: NSView {
     private let cwebpPathField = SettingsView.makeTextField()
     private let cacheRAMField = SettingsView.makeNumberField()
     private let autosaveField = SettingsView.makeNumberField()
+    private let exportJPGCheck = NSButton(checkboxWithTitle: "JPG", target: nil, action: nil)
+    private let exportWebPCheck = NSButton(checkboxWithTitle: "WebP", target: nil, action: nil)
+    private let jpgQualityField = SettingsView.makeNumberField()
+    private let jpgSizingPopup = NSPopUpButton()
+    private let jpgLongEdgeField = SettingsView.makeNumberField()
+    private let webpQualityField = SettingsView.makeNumberField()
+    private let webpLongEdgeField = SettingsView.makeNumberField()
+    private let filenamePatternField = SettingsView.makeTextField()
+    private let cpuLimitField = SettingsView.makeNumberField()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -66,6 +75,14 @@ final class SettingsView: NSView {
         buttons.orientation = .horizontal
         buttons.spacing = 10
 
+        let exportFormats = NSStackView(views: [exportJPGCheck, exportWebPCheck])
+        exportFormats.orientation = .horizontal
+        exportFormats.spacing = 16
+        exportFormats.alignment = .centerY
+
+        jpgSizingPopup.removeAllItems()
+        jpgSizingPopup.addItems(withTitles: JPGSizing.allCases.map(\.displayName))
+
         let rows: [(String, NSView, String)] = [
             ("Double-tap speed (ms)", doubleTapField, "Double-tap Spacebar — previous image. Shortcut: Space Space"),
             ("Rotate step (°)", rotateStepField, "Rotate step — degrees per scroll while holding R. Shortcut: R + scroll"),
@@ -80,6 +97,14 @@ final class SettingsView: NSView {
             ("cwebp path", cwebpPathField, "cwebp path — absolute path to cwebp (empty = auto-detect)"),
             ("Cache RAM cap (MB)", cacheRAMField, "Cache RAM cap — preview LRU cache size in megabytes (default 1536 = 1.5 GB)"),
             ("Autosave interval (s)", autosaveField, "Autosave interval — project JSON autosave frequency in seconds"),
+            ("Export formats", exportFormats, "Export formats — which file types the Process button writes"),
+            ("JPG quality (0–12)", jpgQualityField, "JPG quality — Photoshop-scale quality (default 10)"),
+            ("JPG size", jpgSizingPopup, "JPG size — inch (300 dpi) or long edge in pixels"),
+            ("JPG long edge (px)", jpgLongEdgeField, "JPG long edge — pixels when JPG size is “Long edge (px)”"),
+            ("WebP quality (%)", webpQualityField, "WebP quality — percentage (default 50)"),
+            ("WebP long edge (px)", webpLongEdgeField, "WebP long edge — pixels (0 = full paper size at 300 dpi)"),
+            ("Filename pattern", filenamePatternField, "Filename pattern — tokens {name} {size} {number} {index} (default {name})"),
+            ("CPU core limit", cpuLimitField, "CPU core limit — export parallelism (0 = all cores)"),
         ]
 
         let form = NSStackView()
@@ -135,6 +160,17 @@ final class SettingsView: NSView {
         if let idx = NudgeBasis.allCases.firstIndex(of: settings.nudgeBasis) {
             nudgePopup.selectItem(at: idx)
         }
+        exportJPGCheck.state = settings.export.exportJPG ? .on : .off
+        exportWebPCheck.state = settings.export.exportWebP ? .on : .off
+        jpgQualityField.stringValue = String(settings.export.jpgQuality)
+        jpgLongEdgeField.stringValue = String(settings.export.jpgLongEdge)
+        webpQualityField.stringValue = String(settings.export.webpQuality)
+        webpLongEdgeField.stringValue = String(settings.export.webpLongEdge)
+        filenamePatternField.stringValue = settings.export.filenamePattern
+        cpuLimitField.stringValue = String(settings.cpuLimit)
+        if let idx = JPGSizing.allCases.firstIndex(of: settings.export.jpgSizing) {
+            jpgSizingPopup.selectItem(at: idx)
+        }
     }
 
     private func readFields() -> AppSettings {
@@ -150,6 +186,19 @@ final class SettingsView: NSView {
         let basis = NudgeBasis.allCases[safe: nudgePopup.indexOfSelectedItem] ?? current.nudgeBasis
         let cacheRAMCap = Int(cacheRAMField.stringValue) ?? current.cacheRAMCapMB
         let autosaveSeconds = Int(autosaveField.stringValue) ?? current.autosaveSeconds
+
+        var export = current.export
+        export.exportJPG = exportJPGCheck.state == .on
+        export.exportWebP = exportWebPCheck.state == .on
+        if let v = Int(jpgQualityField.stringValue) { export.jpgQuality = min(12, max(0, v)) }
+        if let idx = JPGSizing.allCases[safe: jpgSizingPopup.indexOfSelectedItem] { export.jpgSizing = idx }
+        if let v = Int(jpgLongEdgeField.stringValue) { export.jpgLongEdge = max(0, v) }
+        if let v = Int(webpQualityField.stringValue) { export.webpQuality = min(100, max(0, v)) }
+        if let v = Int(webpLongEdgeField.stringValue) { export.webpLongEdge = max(0, v) }
+        let pattern = filenamePatternField.stringValue.trimmingCharacters(in: .whitespaces)
+        if !pattern.isEmpty { export.filenamePattern = pattern }
+        let cpuLimit = max(0, Int(cpuLimitField.stringValue) ?? current.cpuLimit)
+
         return AppSettings(
             doubleTapMs: doubleTap,
             rotateStep: rotateStep,
@@ -164,7 +213,9 @@ final class SettingsView: NSView {
             photoshopPath: photoshopPathField.stringValue.trimmingCharacters(in: .whitespaces),
             cwebpPath: cwebpPathField.stringValue.trimmingCharacters(in: .whitespaces),
             cacheRAMCapMB: cacheRAMCap,
-            autosaveSeconds: autosaveSeconds
+            autosaveSeconds: autosaveSeconds,
+            export: export,
+            cpuLimit: cpuLimit
         )
     }
 

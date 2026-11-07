@@ -84,7 +84,7 @@ public final class WebPEncoder {
     public func encode(image: CGImage, to url: URL) -> Bool {
         guard let cwebp = cwebpPath.isEmpty ? Self.resolveCWebP() : cwebpPath,
               FileManager.default.isExecutableFile(atPath: cwebp) else { return false }
-        guard let tmp = Self.writeTempPNG(image) else { return false }
+        guard let tmp = Self.writeTempPNG(image, in: url.deletingLastPathComponent()) else { return false }
         defer { try? FileManager.default.removeItem(atPath: tmp) }
 
         let process = Process()
@@ -101,9 +101,32 @@ public final class WebPEncoder {
         }
     }
 
-    private static func writeTempPNG(_ image: CGImage) -> String? {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("pp-cwebp-\(UUID().uuidString).png")
+    /// Encode for final export: alpha channel disabled and all metadata stripped
+    /// (no EXIF / ICC / XMP). The image is written at its current size; sizing to
+    /// a long edge is handled by the caller's render step.
+    @discardableResult
+    public func encodeExport(image: CGImage, to url: URL) -> Bool {
+        guard let cwebp = cwebpPath.isEmpty ? Self.resolveCWebP() : cwebpPath,
+              FileManager.default.isExecutableFile(atPath: cwebp) else { return false }
+        guard let tmp = Self.writeTempPNG(image, in: url.deletingLastPathComponent()) else { return false }
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: cwebp)
+        process.arguments = ["-q", String(quality), "-noalpha", "-metadata", "none", tmp, "-o", url.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0 && FileManager.default.fileExists(atPath: url.path)
+        } catch {
+            return false
+        }
+    }
+
+    private static func writeTempPNG(_ image: CGImage, in directory: URL) -> String? {
+        let url = directory.appendingPathComponent(".pp-cwebp-\(UUID().uuidString).png")
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
             return nil
         }

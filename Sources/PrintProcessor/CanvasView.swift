@@ -48,6 +48,8 @@ final class CanvasView: NSView {
 
     /// Live settings for zoom/rotate speed, rotate step and nudge basis.
     var settings: AppSettings = .defaults
+    /// Live keyboard bindings (read on every key event, no restart needed).
+    var shortcuts: ShortcutStore = .shared
 
     // Layer 1 / 3 selection state (canvas coordinates, y-up).
     var watermarkBaseSize: CGSize?
@@ -76,6 +78,8 @@ final class CanvasView: NSView {
     var onPreviousFile: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
+    var onRender: (() -> Void)?
+    var onProcess: (() -> Void)?
     var onDropFiles: (([URL]) -> Void)?
 
     /// The selection changed (nil = deselected). `1`/`3` map to the layer.
@@ -796,30 +800,55 @@ final class CanvasView: NSView {
             super.keyDown(with: event)
             return
         }
-        let cmd = event.modifierFlags.contains(.command)
-        let shift = event.modifierFlags.contains(.shift)
+        let store = shortcuts
         let scope = self.scope(for: event)
+
+        // Render / Process (Cmd+R / Cmd+P by default, live-rebindable).
+        if let s = store.entry(.render), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onRender?()
+            return
+        }
+        if let s = store.entry(.process), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onProcess?()
+            return
+        }
+        // Undo / redo (Cmd+Z / Cmd+Shift+Z by default).
+        if let s = store.entry(.undo), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onUndo?()
+            return
+        }
+        if let s = store.entry(.redo), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onRedo?()
+            return
+        }
+        // Next photo (Space by default, live-rebindable).
+        if let s = store.entry(.next), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            if !event.isARepeat { handleSpace() }
+            return
+        }
+        // Rotate modifier (R by default, live-rebindable).
+        if let s = store.entry(.rotate), event.keyCode == s.keyCode {
+            isRDown = true
+            return
+        }
+        // Nudge (arrow keys, fixed 1 px / Shift 10 px).
+        let shift = event.modifierFlags.contains(.shift)
         switch event.keyCode {
         case 123: nudge(dx: shift ? -10 : -1, dy: 0, scope: scope)
         case 124: nudge(dx: shift ? 10 : 1, dy: 0, scope: scope)
         case 126: nudge(dx: 0, dy: shift ? 10 : 1, scope: scope)
         case 125: nudge(dx: 0, dy: shift ? -10 : -1, scope: scope)
-        case 49:
-            if !event.isARepeat { handleSpace() }
-        case 6:
-            if cmd {
-                if shift { onRedo?() } else { onUndo?() }
-            } else {
-                super.keyDown(with: event)
-            }
-        case 15: isRDown = true
         default:
             super.keyDown(with: event)
         }
     }
 
     override func keyUp(with event: NSEvent) {
-        if event.keyCode == 15 { isRDown = false } else { super.keyUp(with: event) }
+        if let s = shortcuts.entry(.rotate), event.keyCode == s.keyCode {
+            isRDown = false
+        } else {
+            super.keyUp(with: event)
+        }
     }
 
     private func nudge(dx: Double, dy: Double, scope: GlobalEditScope) {

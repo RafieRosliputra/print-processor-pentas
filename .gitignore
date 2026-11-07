@@ -1,0 +1,6 @@
+.ds-worker/
+.build/
+*.app
+.DS_Store
+DELIVERABLES/
+

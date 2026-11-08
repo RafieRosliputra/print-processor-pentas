@@ -43,11 +43,13 @@ final class ShortcutsView: NSView {
 
         conflictLabel.isHidden = true
 
-        let header = NSStackView(views: [title, subtitle, reset, hintLabel, conflictLabel])
+        // Header (top): title + subtitle only.
+        let header = NSStackView(views: [title, subtitle])
         header.orientation = .vertical
         header.alignment = .leading
         header.spacing = 8
 
+        // Rows: scrollable, packed to the top (never stretched to fill height).
         rowsStack.orientation = .vertical
         rowsStack.alignment = .leading
         rowsStack.spacing = 0
@@ -62,12 +64,35 @@ final class ShortcutsView: NSView {
         scroll.drawsBackground = false
         scroll.documentView = document
 
+        // Fixed bottom bar: Reset + conflict/hint text, always visible.
+        hintLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        conflictLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let infoStack = NSStackView(views: [hintLabel, conflictLabel])
+        infoStack.orientation = .vertical
+        infoStack.alignment = .leading
+        infoStack.spacing = 2
+        infoStack.detachesHiddenViews = true
+
+        let bottomBar = NSStackView(views: [reset, infoStack])
+        bottomBar.orientation = .horizontal
+        bottomBar.alignment = .centerY
+        bottomBar.spacing = 16
+        bottomBar.detachesHiddenViews = true
+        bottomBar.translatesAutoresizingMaskIntoConstraints = false
+        bottomBar.wantsLayer = true
+        bottomBar.layer?.backgroundColor = NSColor.panel.cgColor
+
         header.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(header)
         addSubview(scroll)
+        addSubview(bottomBar)
 
         NSLayoutConstraint.activate([
+            hintLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 540),
+            conflictLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 540),
+
             header.topAnchor.constraint(equalTo: topAnchor, constant: 20),
             header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
             header.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
@@ -75,7 +100,11 @@ final class ShortcutsView: NSView {
             scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomBar.topAnchor, constant: -8),
+
+            bottomBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+            bottomBar.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24),
+            bottomBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
 
             rowsStack.topAnchor.constraint(equalTo: document.topAnchor),
             rowsStack.leadingAnchor.constraint(equalTo: document.leadingAnchor),

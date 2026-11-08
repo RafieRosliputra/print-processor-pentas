@@ -67,10 +67,13 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var psdTextRenderer: PSDTextLayerRenderer?
     private let overlayExporter = PSDOverlayExporter.standard()
     private var overlayWatcher: FileWatcher?
+    private var psdTextWatcher: FileWatcher?
     private var photoEditWatcher: FileWatcher?
     private var psdTextList: [String: String] = [:]
     private var overlayCounter = -1
     private var overlayPSDPath = ""
+    private var psdTextCounter = -1
+    private var psdStylePreviewPath = ""
     private var layer2RenderGeneration = 0
 
     // Layer-2 / 3 control references.
@@ -80,6 +83,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var psdScanModePopup: NSPopUpButton?
     private var psdPreviewLabel: NSTextField?
     private var psdAlignPopup: NSPopUpButton?
+    private var psdTextOpenButton: NSButton?
+    private var psdTextUpdateButton: NSButton?
     private var overlayOpenButton: NSButton?
 
     /// Layer key (1…6, 0 = gradient) → section, for eye syncing.
@@ -649,6 +654,23 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let pathLabel = makeLabel("No PSD loaded", size: 11, weight: .regular, color: .dimText)
         psdTextPathLabel = pathLabel
 
+        let openButton = NSButton(title: "Open in Photoshop", target: self, action: #selector(openPSDTextInPhotoshop))
+        openButton.bezelStyle = .rounded
+        openButton.controlSize = .regular
+        openButton.toolTip = "Open in Photoshop — open the layer-2 PSD with Photoshop"
+        psdTextOpenButton = openButton
+
+        let updateButton = NSButton(title: "Update", target: self, action: #selector(updatePSDTextClicked))
+        updateButton.bezelStyle = .rounded
+        updateButton.controlSize = .regular
+        updateButton.toolTip = "Update — save the PSD in Photoshop, export a new <name>-NN.webp style preview, and re-render the text"
+        psdTextUpdateButton = updateButton
+
+        let actionRow = NSStackView(views: [openButton, updateButton])
+        actionRow.orientation = .horizontal
+        actionRow.alignment = .centerY
+        actionRow.spacing = 8
+
         let drawBoxButton = NSButton(title: "Draw box", target: self, action: #selector(drawPSDBoxClicked))
         drawBoxButton.bezelStyle = .rounded
         drawBoxButton.controlSize = .regular
@@ -698,7 +720,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let listLabel = makeLabel("List / paste (number → text)", size: 12, weight: .regular, color: .labelColor)
 
         let stack = NSStackView(views: [
-            loadButton, pathLabel, drawBoxButton,
+            loadButton, pathLabel, actionRow, drawBoxButton,
             manualField,
             labelRow("Align", alignPopup),
             labelRow("Scan", scanPopup),
@@ -1119,9 +1141,116 @@ final class ProductionView: NSView, NSTextViewDelegate {
         psdTextPathLabel?.stringValue = URL(fileURLWithPath: path).lastPathComponent
         canvasView.psdTextBox = effectivePSDTextBox()
         canvasView.psdTextAlign = layerSettings.psdText.align
+        startPSDTextWatcher(path)
         scheduleLayer2Render()
         scheduleRenderPreview()
         scheduleAutosave()
+    }
+
+    /// Re-render layer 2 whenever the PSD file is saved (same debounced watch as
+    /// layer 3), so text changes made in Photoshop appear without a manual click.
+    private func startPSDTextWatcher(_ path: String) {
+        psdTextWatcher?.stop()
+        guard !path.isEmpty else { return }
+        psdTextWatcher = FileWatcher(path: path, debounce: 1.0) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.scheduleLayer2Render()
+                self?.scheduleRenderPreview()
+            }
+        }
+        psdTextWatcher?.start()
+    }
+
+    /// Show a short Photoshop error in the status line.
+    private func showPhotoshopError(_ error: String) {
+        let short = error.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .first.map(String.init) ?? error
+        statusLabel.textColor = .systemRed
+        statusLabel.stringValue = "Photoshop: \(short)"
+    }
+
+    @objc private func openPSDTextInPhotoshop() {
+        guard !layerSettings.psdText.path.isEmpty else { return }
+        openInPhotoshop(layerSettings.psdText.path)
+    }
+
+    /// Update: (1) save the open PSD via JSX (no-op if not open), (2) export a
+    /// new <name>-NN.webp style preview beside the PSD, (3) drop caches and
+    /// re-render the text (queued in the background), then refresh the canvas.
+    @objc private func updatePSDTextClicked() {
+        let psdPath = layerSettings.psdText.path
+        guard !psdPath.isEmpty else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Load a PSD first."
+            return
+        }
+        statusLabel.textColor = .dimText
+        statusLabel.stringValue = "Updating PSD text…"
+
+        let runner = PhotoshopRunner(photoshopAppPath: settings.photoshopPath)
+        let psdURL = URL(fileURLWithPath: psdPath)
+        let cacheDir = cacheDirectory()
+        let cwebp = settings.cwebpPath
+        let counter = psdTextCounter
+
+        photoshopQueue.async { [weak self] in
+            guard let self = self else { return }
+            // 1. Save the open document (no-op when it is not open).
+            let saved = runner.saveOpenDocument(psdPath: psdPath)
+            var firstError: String? = saved ? nil : runner.lastError
+
+            // 2. Export a new <name>-NN.webp style preview beside the PSD
+            //    (ImageIO composite first, JSX PNG + cwebp as fallback).
+            let number = WebPNumbering.nextNumber(psdURL: psdURL, counter: counter)
+            let out = WebPNumbering.outputURL(psdURL: psdURL, number: number)
+            var webpURL: URL?
+            if let composite = PSDFlatten.composite(psdPath: psdPath) {
+                if WebPEncoder(cwebpPath: cwebp).encode(image: composite, to: out) {
+                    webpURL = out
+                }
+            }
+            if webpURL == nil {
+                let pngPath = (cacheDir as NSString).appendingPathComponent("pp-style-\(UUID().uuidString).png")
+                if runner.renderPNG(psdPath: psdPath, text: nil, layerName: "", outputPNG: pngPath),
+                   let png = PSDFlatten.composite(psdPath: pngPath) {
+                    if WebPEncoder(cwebpPath: cwebp).encode(image: png, to: out) {
+                        webpURL = out
+                    }
+                }
+                if firstError == nil, let err = runner.lastError, !err.isEmpty { firstError = err }
+                try? FileManager.default.removeItem(atPath: pngPath)
+            }
+
+            let maxNum = WebPNumbering.existingNumbers(psdURL: psdURL).max() ?? counter
+
+            DispatchQueue.main.async {
+                self.psdTextCounter = max(maxNum, counter)
+                if let w = webpURL {
+                    self.psdStylePreviewPath = w.path
+                    self.psdTextPathLabel?.stringValue = "\(psdURL.lastPathComponent) → \(w.lastPathComponent)"
+                }
+                // 3. Drop caches and re-render the text (current image first,
+                //    then the rest queued in the background).
+                self.compositor.invalidateCache()
+                self.scheduleLayer2Render()
+                self.scheduleRenderPreview()
+                self.scheduleAutosave()
+
+                if webpURL == nil {
+                    if let err = firstError, !err.isEmpty {
+                        self.showPhotoshopError(err)
+                    } else {
+                        self.statusLabel.textColor = .systemRed
+                        self.statusLabel.stringValue = "Could not export style preview (cwebp missing?)."
+                    }
+                } else if let err = firstError, !err.isEmpty {
+                    self.showPhotoshopError(err)
+                } else {
+                    self.statusLabel.textColor = .dimText
+                    self.statusLabel.stringValue = "Updated: \(webpURL?.lastPathComponent ?? "")"
+                }
+            }
+        }
     }
 
     /// Route a dropped .psd to layer 2 (when its section is focused) or layer 3;
@@ -1311,8 +1440,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let text = TextSourceResolver.resolve(fileName: fileName, manualText: manualText, list: list, scanMode: mode).text
         let photoshopPath = settings.photoshopPath
 
+        let runner = PhotoshopRunner(photoshopAppPath: photoshopPath)
         let renderer = PSDTextLayerRenderer(
-            runner: PhotoshopRunner(photoshopAppPath: photoshopPath),
+            runner: runner,
             cacheDirectory: cacheDir,
             layerName: layerName,
             minTextScale: minScale
@@ -1324,6 +1454,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
             DispatchQueue.main.async {
                 guard let self = self, gen == self.layer2RenderGeneration else { return }
                 self.compositor.layer2Image = image
+                if image == nil, let err = runner.lastError, !err.isEmpty {
+                    self.showPhotoshopError(err)
+                }
                 self.renderPreview()
             }
         }
@@ -1877,12 +2010,14 @@ final class ProductionView: NSView, NSTextViewDelegate {
             psdTextList = existing.psdTextList
             overlayCounter = existing.overlayCounter
             overlayPSDPath = existing.overlayPSDPath
+            psdTextCounter = existing.psdTextCounter
         } else {
             edits = EditStore()
             layerSettings = .defaults
             psdTextList = [:]
             overlayCounter = -1
             overlayPSDPath = ""
+            psdTextCounter = -1
         }
 
         files = collected
@@ -2244,7 +2379,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
             layerSettings: layerSettings,
             psdTextList: psdTextList,
             overlayCounter: overlayCounter,
-            overlayPSDPath: overlayPSDPath
+            overlayPSDPath: overlayPSDPath,
+            psdTextCounter: psdTextCounter
         )
     }
 
@@ -2303,6 +2439,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
                 psdTextList = model.psdTextList
                 overlayCounter = model.overlayCounter
                 overlayPSDPath = model.overlayPSDPath
+                psdTextCounter = model.psdTextCounter
                 selectedSize = model.selectedSize
                 syncSizeButtons()
                 applyOrientationToCanvas()
@@ -2331,6 +2468,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         psdTextList = [:]
         overlayCounter = -1
         overlayPSDPath = ""
+        psdTextCounter = -1
         selectedSize = nil
         syncSizeButtons()
         applyOrientationToCanvas()

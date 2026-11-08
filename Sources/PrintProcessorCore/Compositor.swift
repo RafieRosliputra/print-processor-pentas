@@ -82,6 +82,76 @@ public enum LayerGeometry {
                       height: (ys.max() ?? 0) - (ys.min() ?? 0))
     }
 
+    /// Axis-aligned bounding box of a list of points (empty → .zero).
+    public static func boundingBox(of corners: [CGPoint]) -> CGRect {
+        let xs = corners.map(\.x)
+        let ys = corners.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(),
+              let minY = ys.min(), let maxY = ys.max() else { return .zero }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// The four corners of `rect` under `transform`, ordered bottom-left,
+    /// bottom-right, top-right, top-left (canvas coordinates, y-up).
+    public static func corners(of rect: CGRect, transform: CGAffineTransform) -> [CGPoint] {
+        [
+            CGPoint(x: rect.minX, y: rect.minY).applying(transform),
+            CGPoint(x: rect.maxX, y: rect.minY).applying(transform),
+            CGPoint(x: rect.maxX, y: rect.maxY).applying(transform),
+            CGPoint(x: rect.minX, y: rect.maxY).applying(transform),
+        ]
+    }
+
+    /// The four corners of a rect centred on the origin (size `baseSize`) after
+    /// the Compositor's scale → rotate → offset-about-centre pipeline. This is
+    /// the exact drawn quad for layers 3/4, so the canvas selection box can be
+    /// drawn and hit-tested against the real transformed shape.
+    public static func centeredCorners(
+        canvas: CGSize,
+        baseSize: CGSize,
+        offsetX: Double,
+        offsetY: Double,
+        scaleX: Double,
+        scaleY: Double,
+        rotationDeg: Double
+    ) -> [CGPoint] {
+        let local = CGRect(x: -baseSize.width / 2, y: -baseSize.height / 2,
+                           width: baseSize.width, height: baseSize.height)
+        let t = centeredTransform(canvas: canvas, offsetX: offsetX, offsetY: offsetY,
+                                  scaleX: scaleX, scaleY: scaleY, rotationDeg: rotationDeg)
+        return corners(of: local, transform: t)
+    }
+
+    /// Layer-3 overlay's drawn corners (fit/fill + free transform), matching the
+    /// renderer's `drawOverlay`. `offsetScale` converts stored paper-pixel
+    /// offsets into the requested canvas space (1 when canvas == paper).
+    public static func overlayCorners(canvas: CGSize, imageSize: CGSize,
+                                      overlay: OverlaySettings, offsetScale: Double = 1) -> [CGPoint] {
+        let base = overlay.fit ? fittedRect(canvas: canvas, imageSize: imageSize)
+                               : filledRect(canvas: canvas, imageSize: imageSize)
+        return centeredCorners(canvas: canvas, baseSize: base.size,
+                               offsetX: overlay.transform.offsetX * offsetScale,
+                               offsetY: overlay.transform.offsetY * offsetScale,
+                               scaleX: overlay.transform.scaleX,
+                               scaleY: overlay.transform.scaleY,
+                               rotationDeg: overlay.transform.rotationDeg)
+    }
+
+    /// Layer-1 watermark's drawn corners (bottom-right anchor + rotation),
+    /// matching the renderer's `drawWatermark`.
+    public static func watermarkCorners(canvas: CGSize, watermark: WatermarkSettings) -> [CGPoint] {
+        let base = watermarkBaseSize(canvas: canvas, watermark: watermark)
+        guard base.width > 0, base.height > 0 else { return [] }
+        let w = base.width * CGFloat(watermark.transform.scaleX)
+        let h = base.height * CGFloat(watermark.transform.scaleY)
+        let ax = canvas.width * (1 - CGFloat(watermark.transform.offsetFractionX))
+        let ay = canvas.height * CGFloat(watermark.transform.offsetFractionY)
+        let rect = CGRect(x: -w, y: 0, width: w, height: h)
+        let t = CGAffineTransform(translationX: ax, y: ay)
+            .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermark.transform.rotationDeg * .pi / 180)))
+        return corners(of: rect, transform: t)
+    }
+
     /// Bounding rect of layer 4 (subject photo) under `edit`.
     public static func photoRect(canvas: CGSize, imageSize: CGSize, edit: ImageEdit) -> CGRect {
         let fit = fittedRect(canvas: canvas, imageSize: imageSize)

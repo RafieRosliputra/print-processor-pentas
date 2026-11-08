@@ -981,6 +981,78 @@ do {
           "Save-as-new-version restores the original photo untouched")
 }
 
+// MARK: - Milestone 6 additions (doJavascript fix, copy flow, overlay box geometry)
+
+// 1. JXA wrapper uses lowercase `doJavascript(` (the -1708 "Message not
+//    understood" fix).
+do {
+    let jxa = PhotoshopRunner.makeJXAScript(jsx: "var x = 1;", appName: "Adobe Photoshop 2026")
+    check(jxa.contains("doJavascript("), "JXA script uses doJavascript( (lowercase s)")
+    check(!jxa.contains("doJava" + "Script("), "JXA script has no capital-S variant")
+}
+
+// 2. Render JSX copies the PSD to a temp file, restores the previously active
+//    document, and never closes or saves a document it did not open itself.
+do {
+    let jsx = PhotoshopRunner.makeJSX(psdPath: "/tmp/a.psd", text: "Norman", layerName: "TEXT",
+                                      outputPNG: "/tmp/out.png", copyPath: "/tmp/copy.psd")
+    check(jsx.contains(".copy("), "render JSX contains the copy flow (srcFile.copy(copyFile))")
+    check(jsx.contains("previousDoc = app.activeDocument")
+          && jsx.contains("app.activeDocument = previousDoc"),
+          "render JSX remembers and restores the active document")
+    check(!jsx.contains("activeDocument.close"),
+          "render JSX never closes the previously active document")
+    check(jsx.contains("doc.close("),
+          "render JSX closes only the copy it opened")
+    check(!jsx.contains("doc.save(") && !jsx.contains("activeDocument.save("),
+          "render JSX never saves a document")
+}
+
+// 3. Layer-3 overlay selection box corners equal the Compositor's transformed
+//    image corners (tolerance 0.5 px) at rotation 0, 17 and -90.
+do {
+    let canvas = CGSize(width: 1200, height: 1800)
+    let imageSize = CGSize(width: 300, height: 200)
+    for rot in [0.0, 17.0, -90.0] {
+        let overlay = OverlaySettings(path: "/tmp/o.webp", fit: true,
+                                      transform: OverlayTransform(offsetX: 40, offsetY: -25,
+                                                                  scaleX: 1.2, scaleY: 0.8, rotationDeg: rot))
+        let got = LayerGeometry.overlayCorners(canvas: canvas, imageSize: imageSize, overlay: overlay)
+        let base = LayerGeometry.fittedRect(canvas: canvas, imageSize: imageSize)
+        let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
+        let t = LayerGeometry.centeredTransform(canvas: canvas,
+                                                offsetX: overlay.transform.offsetX,
+                                                offsetY: overlay.transform.offsetY,
+                                                scaleX: overlay.transform.scaleX,
+                                                scaleY: overlay.transform.scaleY,
+                                                rotationDeg: overlay.transform.rotationDeg)
+        let expected = LayerGeometry.corners(of: local, transform: t)
+        var ok = got.count == 4 && expected.count == 4
+        if ok {
+            for i in 0..<4 {
+                if hypot(got[i].x - expected[i].x, got[i].y - expected[i].y) > 0.5 { ok = false }
+            }
+        }
+        check(ok, "overlay box corners == Compositor corners at rotation \(rot)")
+    }
+}
+
+// 4. Watermark box corners stay consistent with its drawn rect (rotated quad,
+//    not an axis-aligned bounding box).
+do {
+    let canvas = CGSize(width: 1200, height: 1800)
+    let wm = WatermarkSettings(text: "01", sizeFraction: 0.04,
+                               transform: WatermarkTransform(offsetFractionX: 0.05, offsetFractionY: 0.05,
+                                                             scaleX: 1, scaleY: 1, rotationDeg: 45))
+    let corners = LayerGeometry.watermarkCorners(canvas: canvas, watermark: wm)
+    check(corners.count == 4, "watermark corners computed")
+    let rect = LayerGeometry.watermarkRect(canvas: canvas, watermark: wm)
+    let box = LayerGeometry.boundingBox(of: corners)
+    let near = abs(box.minX - rect.minX) < 0.01 && abs(box.minY - rect.minY) < 0.01
+        && abs(box.width - rect.width) < 0.01 && abs(box.height - rect.height) < 0.01
+    check(near, "watermark corners bounding box matches watermarkRect")
+}
+
 if failures == 0 {
     print("PrintProcessorCheck: PASS")
     exit(0)

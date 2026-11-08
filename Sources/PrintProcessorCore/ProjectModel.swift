@@ -23,6 +23,8 @@ public struct ProjectModel: Equatable {
     /// Absolute path of the layer-3 PSD overlay source ("" = none). Persisted so
     /// the watcher can be re-armed and the newest -NN.webp reloaded on reopen.
     public var overlayPSDPath: String
+    /// Highest layer-2 webp number ever exported (never reused); -1 = none yet.
+    public var psdTextCounter: Int
 
     public init(
         workingFolder: String,
@@ -33,7 +35,8 @@ public struct ProjectModel: Equatable {
         layerSettings: LayerSettings = .defaults,
         psdTextList: [String: String] = [:],
         overlayCounter: Int = -1,
-        overlayPSDPath: String = ""
+        overlayPSDPath: String = "",
+        psdTextCounter: Int = -1
     ) {
         self.workingFolder = workingFolder
         self.files = files
@@ -44,6 +47,7 @@ public struct ProjectModel: Equatable {
         self.psdTextList = psdTextList
         self.overlayCounter = overlayCounter
         self.overlayPSDPath = overlayPSDPath
+        self.psdTextCounter = psdTextCounter
     }
 
     /// Absolute URL of the project JSON inside the working folder.
@@ -104,6 +108,7 @@ extension ProjectModel: Codable {
         case psdTextList
         case overlayCounter
         case overlayPSDPath
+        case psdTextCounter
     }
 
     public init(from decoder: Decoder) throws {
@@ -117,6 +122,7 @@ extension ProjectModel: Codable {
         psdTextList = try c.decodeIfPresent([String: String].self, forKey: .psdTextList) ?? [:]
         overlayCounter = try c.decodeIfPresent(Int.self, forKey: .overlayCounter) ?? -1
         overlayPSDPath = try c.decodeIfPresent(String.self, forKey: .overlayPSDPath) ?? ""
+        psdTextCounter = try c.decodeIfPresent(Int.self, forKey: .psdTextCounter) ?? -1
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -130,5 +136,6 @@ extension ProjectModel: Codable {
         try c.encode(psdTextList, forKey: .psdTextList)
         try c.encode(overlayCounter, forKey: .overlayCounter)
         try c.encode(overlayPSDPath, forKey: .overlayPSDPath)
+        try c.encode(psdTextCounter, forKey: .psdTextCounter)
     }
 }

@@ -261,48 +261,94 @@ final class CanvasView: NSView {
         return CGPoint(x: rect.minX + p.x * s, y: rect.minY + p.y * s)
     }
 
-    // MARK: - Layer rects (canvas coordinates)
+    // MARK: - Layer quads (canvas coordinates, y-up)
 
-    private func overlayBox() -> CGRect {
-        guard let base = overlayBaseSize, base.width > 0, base.height > 0 else { return .zero }
-        let s = canvasOffsetScale()
-        let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
-        let t = LayerGeometry.centeredTransform(
+    /// Layer-3 overlay's four drawn corners (fit/fill + free transform), using
+    /// the same pivot/scale/rotation the Compositor's `drawOverlay` uses.
+    private func overlayCorners() -> [CGPoint] {
+        guard let base = overlayBaseSize, base.width > 0, base.height > 0 else { return [] }
+        let s = Double(canvasOffsetScale())
+        return LayerGeometry.centeredCorners(
             canvas: compositePixelSize,
+            baseSize: base,
             offsetX: overlayTransform.offsetX * s,
             offsetY: overlayTransform.offsetY * s,
             scaleX: overlayTransform.scaleX,
             scaleY: overlayTransform.scaleY,
             rotationDeg: overlayTransform.rotationDeg
         )
-        return LayerGeometry.boundingBox(of: local, transform: t)
     }
 
-    private func watermarkBox() -> CGRect {
-        guard let base = watermarkBaseSize, base.width > 0, base.height > 0 else { return .zero }
-        let sx = watermarkTransform.scaleX
-        let sy = watermarkTransform.scaleY
-        let local = CGRect(x: -base.width * sx, y: 0, width: base.width * sx, height: base.height * sy)
+    /// Layer-1 watermark's four drawn corners (bottom-right anchor + rotation).
+    private func watermarkCorners() -> [CGPoint] {
+        guard let base = watermarkBaseSize, base.width > 0, base.height > 0 else { return [] }
+        let w = base.width * CGFloat(watermarkTransform.scaleX)
+        let h = base.height * CGFloat(watermarkTransform.scaleY)
         let ax = CGFloat(Double(compositePixelSize.width) * (1 - watermarkTransform.offsetFractionX))
         let ay = CGFloat(Double(compositePixelSize.height) * watermarkTransform.offsetFractionY)
+        let rect = CGRect(x: -w, y: 0, width: w, height: h)
         let t = CGAffineTransform(translationX: ax, y: ay)
             .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermarkTransform.rotationDeg * .pi / 180)))
-        return LayerGeometry.boundingBox(of: local, transform: t)
+        return LayerGeometry.corners(of: rect, transform: t)
     }
 
-    private func selectionBox() -> CGRect {
+    /// The four corners of the selected layer, in canvas (composite pixel)
+    /// coordinates, ordered bottom-left, bottom-right, top-right, top-left.
+    private func selectionCorners() -> [CGPoint] {
         switch selection {
-        case .overlay: return overlayBox()
-        case .watermark: return watermarkBox()
-        case .psdText: return psdTextBoxCanvasRect()
-        case nil: return .zero
+        case .overlay: return overlayCorners()
+        case .watermark: return watermarkCorners()
+        case .psdText: return rectCorners(psdTextBoxCanvasRect())
+        case nil: return []
         }
+    }
+
+    /// The selected layer's corners converted to screen (view) coordinates.
+    private func selectionScreenQuad() -> [CGPoint] {
+        let s = screenScale()
+        let paper = paperRect()
+        return selectionCorners().map {
+            CGPoint(x: paper.minX + $0.x * s, y: paper.minY + $0.y * s)
+        }
+    }
+
+    /// Convert a canvas-space rect into its four corners.
+    private func rectCorners(_ rect: CGRect) -> [CGPoint] {
+        [
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.maxY),
+            CGPoint(x: rect.minX, y: rect.maxY),
+        ]
     }
 
     /// Layer-2 box in canvas (preview pixel) coordinates.
     private func psdTextBoxCanvasRect() -> CGRect {
         guard let box = psdTextBox else { return .zero }
         return box.pixelRect(canvas: compositePixelSize)
+    }
+
+    /// Whether `p` lies inside the convex quad (point-in-polygon via winding).
+    private func quadContains(_ quad: [CGPoint], _ p: CGPoint) -> Bool {
+        guard quad.count == 4 else { return false }
+        var sign = 0
+        for i in 0..<4 {
+            let a = quad[i]
+            let b = quad[(i + 1) % 4]
+            let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+            if cross != 0 {
+                let s: Int = cross > 0 ? 1 : -1
+                if sign == 0 { sign = s } else if sign != s { return false }
+            }
+        }
+        return true
+    }
+
+    /// Convert canvas-space corners into screen (view) coordinates.
+    private func screenQuad(_ corners: [CGPoint]) -> [CGPoint] {
+        let s = screenScale()
+        let paper = paperRect()
+        return corners.map { CGPoint(x: paper.minX + $0.x * s, y: paper.minY + $0.y * s) }
     }
 
     // MARK: - Selection drawing
@@ -312,78 +358,81 @@ final class CanvasView: NSView {
             selectionLayer.path = nil
             return
         }
-        let canvasBox = selectionBox()
-        guard canvasBox.width > 0, canvasBox.height > 0 else {
+        let quad = selectionScreenQuad()
+        guard quad.count == 4 else {
             selectionLayer.path = nil
             return
         }
-        let box = canvasBox.toScreen(scale: screenScale(), paper: paperRect())
 
         let path = CGMutablePath()
-        path.addRect(box)
+        path.move(to: quad[0])
+        for i in 1..<4 { path.addLine(to: quad[i]) }
+        path.closeSubpath()
 
-        for handle in scaleHandles(in: box) {
+        for handle in scaleHandles(in: quad) {
             path.addRect(CGRect(x: handle.x - Self.handleSize / 2, y: handle.y - Self.handleSize / 2,
                                 width: Self.handleSize, height: Self.handleSize))
         }
-        if selection != .psdText {
-            for handle in rotateHandles(in: box) {
-                path.addEllipse(in: CGRect(x: handle.x - Self.rotateHandleRadius, y: handle.y - Self.rotateHandleRadius,
-                                           width: Self.rotateHandleRadius * 2, height: Self.rotateHandleRadius * 2))
-            }
+        if selection != .psdText, let rotate = rotateHandle(quad: quad) {
+            path.addEllipse(in: CGRect(x: rotate.x - Self.rotateHandleRadius, y: rotate.y - Self.rotateHandleRadius,
+                                       width: Self.rotateHandleRadius * 2, height: Self.rotateHandleRadius * 2))
         }
         selectionLayer.path = path
     }
 
-    private func scaleHandles(in box: CGRect) -> [CGPoint] {
-        let xs = [box.minX, box.midX, box.maxX]
-        let ys = [box.minY, box.midY, box.maxY]
-        var points: [CGPoint] = []
-        for x in xs {
-            for y in ys where x != box.midX || y != box.midY {
-                points.append(CGPoint(x: x, y: y))
-            }
-        }
-        return points
+    /// The 8 free-transform scale handles for a rotated quad: 4 corners first
+    /// (0…3, bottom-left → top-left), then 4 edge midpoints (4…7, bottom →
+    /// right → top → left).
+    private func scaleHandles(in quad: [CGPoint]) -> [CGPoint] {
+        guard quad.count == 4 else { return [] }
+        let mid = [
+            CGPoint(x: (quad[0].x + quad[1].x) / 2, y: (quad[0].y + quad[1].y) / 2),
+            CGPoint(x: (quad[1].x + quad[2].x) / 2, y: (quad[1].y + quad[2].y) / 2),
+            CGPoint(x: (quad[2].x + quad[3].x) / 2, y: (quad[2].y + quad[3].y) / 2),
+            CGPoint(x: (quad[3].x + quad[0].x) / 2, y: (quad[3].y + quad[0].y) / 2),
+        ]
+        return quad + mid
     }
 
-    /// Orange glow around a hovered layer-2/3 element.
+    /// Orange glow around a hovered layer-2/3 element (drawn as the real quad).
     private func updateHoverLayer() {
         guard let hovered = hoveredLayer else {
             hoverLayer.path = nil
             return
         }
-        let box: CGRect
+        let quad: [CGPoint]
         switch hovered {
-        case 2: box = psdTextBoxCanvasRect()
-        case 3: box = overlayBox()
-        default: box = .zero
+        case 2: quad = rectCorners(psdTextBoxCanvasRect())
+        case 3: quad = overlayCorners()
+        default: quad = []
         }
-        guard box.width > 0, box.height > 0 else {
+        guard quad.count == 4 else {
             hoverLayer.path = nil
             return
         }
-        let screen = box.toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4)
+        let s = screenScale()
+        let paper = paperRect()
+        let screen = quad.map { CGPoint(x: paper.minX + $0.x * s, y: paper.minY + $0.y * s) }
         let path = CGMutablePath()
-        path.addRect(screen)
+        path.move(to: screen[0])
+        for i in 1..<4 { path.addLine(to: screen[i]) }
+        path.closeSubpath()
         hoverLayer.path = path
     }
 
-    private func rotateHandles(in box: CGRect) -> [CGPoint] {
-        let d = Self.rotateOffset
-        let corners = [
-            CGPoint(x: box.minX, y: box.minY),
-            CGPoint(x: box.maxX, y: box.minY),
-            CGPoint(x: box.minX, y: box.maxY),
-            CGPoint(x: box.maxX, y: box.maxY),
-        ]
-        // Diagonal outward direction for each corner.
-        let dirs = [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1), CGPoint(x: -1, y: 1), CGPoint(x: 1, y: 1)]
-        return zip(corners, dirs).map { corner, dir in
-            let len = max(abs(dir.x), abs(dir.y))
-            let norm = CGPoint(x: dir.x / len, y: dir.y / len)
-            return CGPoint(x: corner.x + norm.x * d, y: corner.y + norm.y * d)
-        }
+    /// The single rotate handle: just above the top edge, along the quad's
+    /// outward "up" direction (Photoshop-style rotate affordance).
+    private func rotateHandle(quad: [CGPoint]) -> CGPoint? {
+        guard quad.count == 4 else { return nil }
+        let center = CGPoint(x: (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4,
+                             y: (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4)
+        let topMid = CGPoint(x: (quad[2].x + quad[3].x) / 2, y: (quad[2].y + quad[3].y) / 2)
+        let dx = topMid.x - center.x
+        let dy = topMid.y - center.y
+        let len = hypot(dx, dy)
+        guard len > 0.0001 else { return nil }
+        return CGPoint(x: topMid.x + dx / len * Self.rotateOffset,
+                       y: topMid.y + dy / len * Self.rotateOffset)
     }
 
     // MARK: - Rendering
@@ -465,9 +514,9 @@ final class CanvasView: NSView {
         guard !locked else { hoveredLayer = nil; return }
         let screenPoint = convert(event.locationInWindow, from: nil)
         if let psdBox = psdTextBox,
-           psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+           quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
             hoveredLayer = 2
-        } else if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+        } else if overlayCorners().count == 4 && quadContains(screenQuad(overlayCorners()), screenPoint) {
             hoveredLayer = 3
         } else {
             hoveredLayer = nil
@@ -481,9 +530,9 @@ final class CanvasView: NSView {
             let screenPoint = convert(event.locationInWindow, from: nil)
             var layer: Int? = nil
             if let psdBox = psdTextBox,
-               psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+               quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
                 layer = 2
-            } else if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            } else if overlayCorners().count == 4 && quadContains(screenQuad(overlayCorners()), screenPoint) {
                 layer = 3
             } else if paperRect().contains(screenPoint) {
                 layer = 4
@@ -523,16 +572,16 @@ final class CanvasView: NSView {
         // 1. Handle an existing selection (rotate / scale / move / deselect).
         if let sel = selection {
             let shift = event.modifierFlags.contains(.shift)
-            if sel != .psdText,
-               hitRotateHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
+            let quad = selectionScreenQuad()
+            if sel != .psdText, hitRotateHandle(screenPoint, quad: quad) {
                 beginTransform(sel, mode: .rotate, start: canvas, option: event.modifierFlags.contains(.option), shift: shift)
                 return
             }
-            if let handle = hitScaleHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
+            if let handle = hitScaleHandle(screenPoint, quad: quad) {
                 beginTransform(sel, mode: .scale, start: canvas, option: event.modifierFlags.contains(.option), shift: shift, scaleHandle: handle)
                 return
             }
-            if selectionBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+            if quadContains(quad, screenPoint) {
                 beginTransform(sel, mode: .move, start: canvas, option: event.modifierFlags.contains(.option), shift: shift)
                 return
             }
@@ -542,17 +591,19 @@ final class CanvasView: NSView {
 
         // 2. Select psd text box, overlay (above photo), or watermark when clicked.
         if let psdBox = psdTextBox,
-           psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+           quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
             selection = .psdText
             beginTransform(.psdText, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
         }
-        if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+        let overlayQ = overlayCorners()
+        if overlayQ.count == 4 && quadContains(screenQuad(overlayQ), screenPoint) {
             selection = .overlay
             beginTransform(.overlay, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
         }
-        if !watermarkBox().isEmpty && watermarkBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
+        let watermarkQ = watermarkCorners()
+        if watermarkQ.count == 4 && quadContains(screenQuad(watermarkQ), screenPoint) {
             selection = .watermark
             beginTransform(.watermark, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
@@ -660,9 +711,9 @@ final class CanvasView: NSView {
 
     private func scaleHandleKind(_ index: Int) -> ScaleHandleKind {
         switch index {
-        case 0, 2, 5, 7: return .corner
-        case 1, 6: return .edgeX
-        default: return .edgeY
+        case 0, 1, 2, 3: return .corner
+        case 4, 6: return .edgeY
+        default: return .edgeX
         }
     }
 
@@ -797,12 +848,13 @@ final class CanvasView: NSView {
         return (nowAngle - startAngle) * 180 / .pi
     }
 
-    private func hitRotateHandle(_ p: CGPoint, box: CGRect) -> Bool {
-        rotateHandles(in: box).contains { hypot($0.x - p.x, $0.y - p.y) <= Self.hitThreshold }
+    private func hitRotateHandle(_ p: CGPoint, quad: [CGPoint]) -> Bool {
+        guard let h = rotateHandle(quad: quad) else { return false }
+        return hypot(h.x - p.x, h.y - p.y) <= Self.hitThreshold
     }
 
-    private func hitScaleHandle(_ p: CGPoint, box: CGRect) -> Int? {
-        let handles = scaleHandles(in: box)
+    private func hitScaleHandle(_ p: CGPoint, quad: [CGPoint]) -> Int? {
+        let handles = scaleHandles(in: quad)
         for (i, h) in handles.enumerated() where hypot(h.x - p.x, h.y - p.y) <= Self.hitThreshold {
             return i
         }

@@ -16,10 +16,13 @@ public enum WatermarkTextProvider {
     public static var current: Provider = defaultText
 
     /// Default rule: right part of the file name split on " - ", extension
-    /// removed, or empty when no " - " separator is present.
+    /// removed; with no separator the whole name (no extension) is used.
     public static func defaultText(for fileName: String) -> String {
         let parts = fileName.components(separatedBy: " - ")
-        guard parts.count >= 2 else { return "" }
+        guard parts.count >= 2 else {
+            // No separator ("123.webp"): the whole name (no extension) is the watermark.
+            return URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+        }
         let right = parts[parts.count - 1]
         let url = URL(fileURLWithPath: right)
         let stem = url.deletingPathExtension().lastPathComponent

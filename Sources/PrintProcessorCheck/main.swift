@@ -160,8 +160,8 @@ check(roundTripOK, "ProjectModel JSON round-trip")
 // 4. Watermark default text from "Tingkatan 1C - 01.jpg" is "01".
 check(WatermarkTextProvider.defaultText(for: "Tingkatan 1C - 01.jpg") == "01",
       "Watermark default text for \"Tingkatan 1C - 01.jpg\" -> \"01\"")
-check(WatermarkTextProvider.defaultText(for: "no-separator.jpg") == "",
-      "Watermark default text empty without \" - \" separator")
+check(WatermarkTextProvider.defaultText(for: "123.webp") == "123",
+      "Watermark default text is the whole name without \" - \" separator")
 
 // 7. LayerSettings JSON round-trip (incl. FinalBackground enum and extra layers).
 var ls = LayerSettings.defaults

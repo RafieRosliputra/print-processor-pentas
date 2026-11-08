@@ -51,13 +51,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var watermarkOpacityValue: NSTextField?
     private var overlayPathLabel: NSTextField?
     private var overlayFitPopup: NSPopUpButton?
-    private var gradientColourAWell: NSColorWell?
-    private var gradientColourBWell: NSColorWell?
-    private var gradientAngleSlider: NSSlider?
-    private var gradientAngleValue: NSTextField?
-    private var gradientOpacitySlider: NSSlider?
-    private var gradientOpacityValue: NSTextField?
-    private var gradientBlendPopup: NSPopUpButton?
+    private var extraLayersContainer: NSStackView?
     private var bg5PathLabel: NSTextField?
     private var bg6ColourWell: NSColorWell?
     private var bg6PathLabel: NSTextField?
@@ -69,6 +63,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var overlayWatcher: FileWatcher?
     private var psdTextWatcher: FileWatcher?
     private var photoEditWatcher: FileWatcher?
+    /// Per-extra-layer PSD watchers (keyed by layer id).
+    private var extraLayerWatchers: [UUID: FileWatcher] = [:]
+    /// The extra layer currently selected on the canvas (highlighted row).
+    private var selectedExtraLayerID: UUID?
     private var psdTextList: [String: String] = [:]
     private var overlayCounter = -1
     private var overlayPSDPath = ""
@@ -87,7 +85,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var psdTextUpdateButton: NSButton?
     private var overlayOpenButton: NSButton?
 
-    /// Layer key (1…6, 0 = gradient) → section, for eye syncing.
+    /// Layer key (1…6) → section, for eye syncing.
     private var sections: [Int: SectionView] = [:]
 
     private var lastEdit: ImageEdit?
@@ -333,13 +331,23 @@ final class ProductionView: NSView, NSTextViewDelegate {
         canvasView.onRedo = { [weak self] in self?.redo() }
         canvasView.onDropFiles = { [weak self] urls in self?.importFiles(urls) }
         canvasView.onSelectionChanged = { [weak self] layer in
-            self?.selectedLayerNumber = layer
+            guard let self = self else { return }
+            if case .extraLayer(let id) = layer {
+                self.selectedExtraLayerID = id
+            } else {
+                self.selectedExtraLayerID = nil
+            }
+            self.selectedLayerNumber = layer?.layerNumber
+            self.reloadExtraLayersUI()
         }
         canvasView.onWatermarkChanged = { [weak self] transform, commit, option in
             self?.handleWatermarkChange(transform, commit: commit, option: option)
         }
         canvasView.onOverlayChanged = { [weak self] transform, commit, option in
             self?.handleOverlayChange(transform, commit: commit, option: option)
+        }
+        canvasView.onExtraLayerChanged = { [weak self] id, transform, commit, option in
+            self?.handleExtraLayerChange(id: id, transform: transform, commit: commit, option: option)
         }
         canvasView.onPSDTextBoxChanged = { [weak self] box, commit, option in
             self?.handlePSDTextBoxChanged(box, commit: commit, option: option)
@@ -425,7 +433,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let watermarkSection = SectionView(title: "Watermark", body: makeWatermarkBody())
         let psdSection = SectionView(title: "PSD Text", body: makePSDTextBody())
         let overlaySection = SectionView(title: "Overlay", body: makeOverlayBody())
-        let gradientSection = SectionView(title: "Gradient", body: makeGradientBody())
+        let gradientSection = SectionView(title: "Gradient", body: makeExtraLayersBody())
         let photoSection = SectionView(title: "Photo", body: makePhotoSectionBody())
         let bg5Section = SectionView(title: "Background", body: makeBackgroundBody())
         let bg6Section = SectionView(title: "Final Background", body: makeFinalBackgroundBody())
@@ -433,12 +441,11 @@ final class ProductionView: NSView, NSTextViewDelegate {
         watermarkSection.onEyeToggle = { [weak self] on in self?.setLayerEnabled(1, on) }
         psdSection.onEyeToggle = { [weak self] on in self?.setLayerEnabled(2, on) }
         overlaySection.onEyeToggle = { [weak self] on in self?.setLayerEnabled(3, on) }
-        gradientSection.onEyeToggle = { [weak self] on in self?.setGradientEnabled(on) }
         photoSection.onEyeToggle = { [weak self] on in self?.setLayerEnabled(4, on) }
         bg5Section.onEyeToggle = { [weak self] on in self?.setLayerEnabled(5, on) }
         bg6Section.onEyeToggle = { [weak self] on in self?.setLayerEnabled(6, on) }
 
-        sections = [1: watermarkSection, 2: psdSection, 3: overlaySection, 0: gradientSection,
+        sections = [1: watermarkSection, 2: psdSection, 3: overlaySection,
                     4: photoSection, 5: bg5Section, 6: bg6Section]
 
         for section in [exportSection, watermarkSection, psdSection, overlaySection, gradientSection, photoSection, bg5Section, bg6Section] {
@@ -831,48 +838,288 @@ final class ProductionView: NSView, NSTextViewDelegate {
         return makeBody(stack)
     }
 
-    private func makeGradientBody() -> NSView {
-        let colourA = NSColorWell()
-        colourA.color = colorFromRGB(layerSettings.gradient.colorA)
-        colourA.target = self
-        colourA.action = #selector(gradientColourAChanged)
-        colourA.toolTip = "Gradient colour A — start colour of the two-stop gradient"
-        gradientColourAWell = colourA
+    private func makeExtraLayersBody() -> NSView {
+        let addButton = NSButton(title: "Add layer…", target: self, action: #selector(addExtraLayerClicked))
+        addButton.bezelStyle = .rounded
+        addButton.controlSize = .regular
+        addButton.toolTip = "Add layer… — add a PNG/WebP/JPG/PSD layer between the photo and the overlay"
 
-        let colourB = NSColorWell()
-        colourB.color = colorFromRGB(layerSettings.gradient.colorB)
-        colourB.target = self
-        colourB.action = #selector(gradientColourBChanged)
-        colourB.toolTip = "Gradient colour B — end colour of the two-stop gradient"
-        gradientColourBWell = colourB
+        let hint = makeLabel("Drag images here, or use “Add layer…”.", size: 11, weight: .regular, color: .dimText)
 
-        let angleSlider = NSSlider(value: layerSettings.gradient.angle, minValue: 0, maxValue: 360,
-                                   target: self, action: #selector(gradientAngleChanged))
-        angleSlider.toolTip = "Angle — gradient direction in degrees (0 = left→right, 90 = bottom→top)"
-        gradientAngleSlider = angleSlider
-        gradientAngleValue = makeLabel(formatDegrees(layerSettings.gradient.angle), size: 11, weight: .regular, color: .dimText)
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+        extraLayersContainer = container
 
-        let opacitySlider = NSSlider(value: layerSettings.gradient.opacity, minValue: 0, maxValue: 1,
-                                     target: self, action: #selector(gradientOpacityChanged))
-        opacitySlider.toolTip = "Opacity — overall gradient opacity"
-        gradientOpacitySlider = opacitySlider
-        gradientOpacityValue = makeLabel(formatPercent(layerSettings.gradient.opacity), size: 11, weight: .regular, color: .dimText)
+        let stack = NSStackView(views: [addButton, hint, container])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 24, bottom: 10, right: 10)
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let blendPopup = NSPopUpButton()
-        for blend in GradientBlend.allCases { blendPopup.addItem(withTitle: blend.displayName) }
-        blendPopup.target = self
-        blendPopup.action = #selector(gradientBlendChanged)
-        blendPopup.toolTip = "Blend — gradient blend mode (normal/multiply/screen/overlay)"
-        gradientBlendPopup = blendPopup
+        // Rows fill the stack's inset content area (24 left + 10 right).
+        container.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -34).isActive = true
 
-        let stack = NSStackView(views: [
-            labelRow("Colour A", colourA),
-            labelRow("Colour B", colourB),
-            sliderRow("Angle", angleSlider, gradientAngleValue!),
-            sliderRow("Opacity", opacitySlider, gradientOpacityValue!),
-            labelRow("Blend", blendPopup),
+        let drop = ExtraLayerDropContainer()
+        drop.onDrop = { [weak self] urls in self?.addExtraLayers(from: urls) }
+        drop.translatesAutoresizingMaskIntoConstraints = false
+        drop.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: drop.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: drop.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: drop.trailingAnchor),
+            drop.bottomAnchor.constraint(equalTo: stack.bottomAnchor),
         ])
-        return makeBody(stack)
+
+        reloadExtraLayersUI()
+        return drop
+    }
+
+    /// Rebuild the extra-layer rows to mirror `layerSettings.extraLayers`.
+    private func reloadExtraLayersUI() {
+        guard let container = extraLayersContainer else { return }
+        for v in container.arrangedSubviews { container.removeArrangedSubview(v); v.removeFromSuperview() }
+        let layers = layerSettings.extraLayers
+        for (i, layer) in layers.enumerated() {
+            let row = ExtraLayerRowView(layerID: layer.id)
+            row.configure(with: layer, canMoveUp: i > 0, canMoveDown: i < layers.count - 1,
+                          isSelected: layer.id == selectedExtraLayerID)
+            row.onToggleEnabled = { [weak self] enabled in self?.setExtraLayer(layer.id) { $0.enabled = enabled } }
+            row.onOpacityChanged = { [weak self] value in self?.setExtraLayer(layer.id) { $0.opacity = min(1, max(0, value)) } }
+            row.onBlendChanged = { [weak self] blend in self?.setExtraLayer(layer.id) { $0.blend = blend } }
+            row.onClipChanged = { [weak self] clip in self?.setExtraLayer(layer.id) { $0.clipToPhoto = clip } }
+            row.onMoveUp = { [weak self] in self?.moveExtraLayer(layer.id, up: true) }
+            row.onMoveDown = { [weak self] in self?.moveExtraLayer(layer.id, up: false) }
+            row.onDelete = { [weak self] in self?.deleteExtraLayer(layer.id) }
+            row.onReplaceFile = { [weak self] in self?.replaceExtraLayerFile(layer.id) }
+            row.onOpenInPhotoshop = { [weak self] in self?.openExtraLayerPSD(layer.id) }
+            row.onSelect = { [weak self] in self?.selectExtraLayer(layer.id) }
+            container.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        }
+    }
+
+    /// Mutate one extra layer, then refresh the preview + UI + autosave.
+    private func setExtraLayer(_ id: UUID, _ mutate: (inout ExtraLayer) -> Void) {
+        guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&layerSettings.extraLayers[idx])
+        afterExtraLayersChanged()
+    }
+
+    private func afterExtraLayersChanged() {
+        compositor.invalidateCache()
+        reloadExtraLayersUI()
+        updateLayerSelectionState()
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    // MARK: - Extra layers
+
+    @objc private func addExtraLayerClicked() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.png, .webP, .jpeg]
+        if let psdType = UTType(filenameExtension: "psd") { panel.allowedContentTypes.append(psdType) }
+        panel.message = "Choose images (PNG, WebP, JPEG, PSD)."
+        panel.prompt = "Add"
+        guard panel.runModal() == .OK else { return }
+        addExtraLayers(from: panel.urls)
+    }
+
+    private func addExtraLayers(from urls: [URL]) {
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            guard ["png", "webp", "jpg", "jpeg", "psd"].contains(ext) else { continue }
+            addExtraLayer(url: url)
+        }
+    }
+
+    private func addExtraLayer(url: URL) {
+        let layer: ExtraLayer
+        if url.pathExtension.lowercased() == "psd" {
+            var l = ExtraLayer.new(path: "", name: url.deletingPathExtension().lastPathComponent)
+            l.psd = PSDOverlaySource(psdPath: url.path, counter: -1)
+            layer = l
+        } else {
+            layer = ExtraLayer.new(path: url.path)
+        }
+        layerSettings.extraLayers.append(layer)
+        if layer.isPSD {
+            startExtraLayerPSD(id: layer.id, psdURL: url)
+        }
+        afterExtraLayersChanged()
+        preloadLayerImages()
+        selectExtraLayer(layer.id)
+    }
+
+    private func mutateExtraLayer(_ id: UUID, _ mutate: (inout ExtraLayer) -> Void) {
+        guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&layerSettings.extraLayers[idx])
+    }
+
+    private func extraLayerPSDCounter(_ id: UUID) -> Int {
+        layerSettings.extraLayers.first { $0.id == id }?.psd.counter ?? -1
+    }
+
+    /// Shared PSD→webp export used by layer 3 and extra layers (flatten, encode,
+    /// never-reuse numbering). Returns the written webp path and the advanced
+    /// counter, or nil on failure.
+    private func exportPSDWebp(psdURL: URL, counter: Int) -> (path: String, counter: Int)? {
+        guard let out = overlayExporter.export(psdURL: psdURL, counter: counter) else { return nil }
+        var src = PSDOverlaySource(psdPath: psdURL.path, counter: counter)
+        src.advanceCounter(psdURL: psdURL)
+        return (out.path, src.counter)
+    }
+
+    private func startExtraLayerPSD(id: UUID, psdURL: URL) {
+        let counter = extraLayerPSDCounter(id)
+        photoshopQueue.async { [weak self] in
+            guard let self = self else { return }
+            if let out = self.exportPSDWebp(psdURL: psdURL, counter: counter) {
+                DispatchQueue.main.async {
+                    self.mutateExtraLayer(id) { layer in
+                        layer.path = out.path
+                        layer.psd = PSDOverlaySource(psdPath: psdURL.path, counter: out.counter)
+                    }
+                    self.compositor.invalidateCache()
+                    self.preloadLayerImages()
+                    self.reloadExtraLayersUI()
+                    self.scheduleRenderPreview()
+                    self.scheduleAutosave()
+                    self.startExtraLayerWatcher(id: id, psdURL: psdURL)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.statusLabel.textColor = .systemRed
+                    self.statusLabel.stringValue = "Could not flatten PSD layer."
+                }
+            }
+        }
+    }
+
+    private func startExtraLayerWatcher(id: UUID, psdURL: URL) {
+        extraLayerWatchers[id]?.stop()
+        let watcher = FileWatcher(path: psdURL.path, debounce: 2.0) { [weak self] path in
+            guard let self = self else { return }
+            let psd = URL(fileURLWithPath: path)
+            DispatchQueue.main.async {
+                let counter = self.extraLayerPSDCounter(id)
+                self.photoshopQueue.async {
+                    if let out = self.exportPSDWebp(psdURL: psd, counter: counter) {
+                        DispatchQueue.main.async {
+                            self.mutateExtraLayer(id) { layer in
+                                layer.path = out.path
+                                layer.psd = PSDOverlaySource(psdPath: psd.path, counter: out.counter)
+                            }
+                            self.compositor.invalidateCache()
+                            self.preloadLayerImages()
+                            self.reloadExtraLayersUI()
+                            self.scheduleRenderPreview()
+                            self.scheduleAutosave()
+                            self.startExtraLayerWatcher(id: id, psdURL: psd)
+                        }
+                    }
+                }
+            }
+        }
+        extraLayerWatchers[id] = watcher
+        watcher.start()
+    }
+
+    /// Restore persisted extra-layer PSD sources: re-arm watchers and reload the
+    /// newest numbered webp beside each PSD (used when reopening a project).
+    private func restoreExtraLayerPSDs() {
+        // Drop watchers from a previous project, then re-arm only the current
+        // layers' PSD sources.
+        for (_, watcher) in extraLayerWatchers { watcher.stop() }
+        extraLayerWatchers.removeAll()
+
+        var restored = false
+        for extra in layerSettings.extraLayers where extra.isPSD {
+            let psdURL = URL(fileURLWithPath: extra.psd.psdPath)
+            guard FileManager.default.fileExists(atPath: psdURL.path) else { continue }
+            if let newest = WebPNumbering.existingNumbers(psdURL: psdURL).max() {
+                let candidate = WebPNumbering.outputURL(psdURL: psdURL, number: newest)
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    mutateExtraLayer(extra.id) { $0.path = candidate.path }
+                    restored = true
+                }
+            }
+            startExtraLayerWatcher(id: extra.id, psdURL: psdURL)
+        }
+        if restored {
+            compositor.invalidateCache()
+        }
+    }
+
+    private func moveExtraLayer(_ id: UUID, up: Bool) {
+        guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
+        let target = up ? idx - 1 : idx + 1
+        guard layerSettings.extraLayers.indices.contains(target) else { return }
+        layerSettings.extraLayers.swapAt(idx, target)
+        afterExtraLayersChanged()
+    }
+
+    private func deleteExtraLayer(_ id: UUID) {
+        guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
+        let name = layerSettings.extraLayers[idx].name
+        let alert = NSAlert()
+        alert.messageText = "Delete layer"
+        alert.informativeText = "Delete “\(name)” from the project?"
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        extraLayerWatchers[id]?.stop()
+        extraLayerWatchers.removeValue(forKey: id)
+        layerSettings.extraLayers.remove(at: idx)
+        if selectedExtraLayerID == id { selectedExtraLayerID = nil }
+        afterExtraLayersChanged()
+    }
+
+    private func replaceExtraLayerFile(_ id: UUID) {
+        guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.png, .webP, .jpeg]
+        if let psdType = UTType(filenameExtension: "psd") { panel.allowedContentTypes.append(psdType) }
+        panel.message = "Choose a replacement image (PNG, WebP, JPEG, PSD)."
+        panel.prompt = "Replace"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        extraLayerWatchers[id]?.stop()
+        extraLayerWatchers.removeValue(forKey: id)
+
+        if url.pathExtension.lowercased() == "psd" {
+            layerSettings.extraLayers[idx].path = ""
+            layerSettings.extraLayers[idx].psd = PSDOverlaySource(psdPath: url.path, counter: -1)
+            layerSettings.extraLayers[idx].name = url.deletingPathExtension().lastPathComponent
+            startExtraLayerPSD(id: id, psdURL: url)
+        } else {
+            layerSettings.extraLayers[idx].path = url.path
+            layerSettings.extraLayers[idx].psd = PSDOverlaySource()
+            layerSettings.extraLayers[idx].name = url.deletingPathExtension().lastPathComponent
+            afterExtraLayersChanged()
+            preloadLayerImages()
+        }
+    }
+
+    private func openExtraLayerPSD(_ id: UUID) {
+        guard let layer = layerSettings.extraLayers.first(where: { $0.id == id }),
+              !layer.psd.psdPath.isEmpty else { return }
+        openInPhotoshop(layer.psd.psdPath)
+    }
+
+    private func selectExtraLayer(_ id: UUID) {
+        selectedExtraLayerID = id
+        reloadExtraLayersUI()
+        canvasView.selectExtraLayer(id)
     }
 
     private func makeBackgroundBody() -> NSView {
@@ -991,21 +1238,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
         scheduleAutosave()
     }
 
-    private func setGradientEnabled(_ enabled: Bool) {
-        layerSettings.gradient.enabled = enabled
-        scheduleRenderPreview()
-        scheduleAutosave()
-    }
-
     private func applyLayerSettingsToUI() {
         for (key, section) in sections {
-            let enabled: Bool
-            if key == 0 {
-                enabled = layerSettings.gradient.enabled
-            } else {
-                enabled = layerSettings.enabled[key]
-            }
-            section.setVisible(enabled)
+            section.setVisible(layerSettings.enabled[key])
         }
         syncControls()
     }
@@ -1016,11 +1251,6 @@ final class ProductionView: NSView, NSTextViewDelegate {
         watermarkSizeSlider?.doubleValue = layerSettings.watermark.sizeFraction
         watermarkOpacitySlider?.doubleValue = layerSettings.watermark.opacity
         watermarkColourWell?.color = colorFromRGB(layerSettings.watermark.colour)
-        gradientColourAWell?.color = colorFromRGB(layerSettings.gradient.colorA)
-        gradientColourBWell?.color = colorFromRGB(layerSettings.gradient.colorB)
-        gradientAngleSlider?.doubleValue = layerSettings.gradient.angle
-        gradientOpacitySlider?.doubleValue = layerSettings.gradient.opacity
-        gradientBlendPopup?.selectItem(at: GradientBlend.allCases.firstIndex(of: layerSettings.gradient.blend) ?? 0)
         if case .colour(let c) = layerSettings.bg6 { bg6ColourWell?.color = colorFromRGB(c) }
         overlayPathLabel?.stringValue = pathSummary(layerSettings.overlay.path, empty: "No overlay loaded")
         overlayFitPopup?.selectItem(at: layerSettings.overlay.fit ? 0 : 1)
@@ -1028,14 +1258,13 @@ final class ProductionView: NSView, NSTextViewDelegate {
         bg6PathLabel?.stringValue = finalBackgroundSummary()
         watermarkSizeValue?.stringValue = formatPercent(layerSettings.watermark.sizeFraction)
         watermarkOpacityValue?.stringValue = formatPercent(layerSettings.watermark.opacity)
-        gradientAngleValue?.stringValue = formatDegrees(layerSettings.gradient.angle)
-        gradientOpacityValue?.stringValue = formatPercent(layerSettings.gradient.opacity)
         psdTextPathLabel?.stringValue = pathSummary(layerSettings.psdText.path, empty: "No PSD loaded")
         if let idx = TextAlign.allCases.firstIndex(of: layerSettings.psdText.align) {
             psdAlignPopup?.selectItem(at: idx)
         }
         canvasView.psdTextBox = effectivePSDTextBox()
         canvasView.psdTextAlign = layerSettings.psdText.align
+        reloadExtraLayersUI()
     }
 
     // MARK: - Actions (layers)
@@ -1088,46 +1317,6 @@ final class ProductionView: NSView, NSTextViewDelegate {
             self?.scheduleRenderPreview()
             self?.scheduleAutosave()
         }
-    }
-
-    @objc private func gradientColourAChanged() {
-        guard let well = gradientColourAWell else { return }
-        layerSettings.gradient.colorA = rgbFromColor(well.color)
-        scheduleRenderPreview()
-        scheduleAutosave()
-    }
-
-    @objc private func gradientColourBChanged() {
-        guard let well = gradientColourBWell else { return }
-        layerSettings.gradient.colorB = rgbFromColor(well.color)
-        scheduleRenderPreview()
-        scheduleAutosave()
-    }
-
-    @objc private func gradientAngleChanged() {
-        guard let slider = gradientAngleSlider else { return }
-        layerSettings.gradient.angle = slider.doubleValue
-        gradientAngleValue?.stringValue = formatDegrees(slider.doubleValue)
-        scheduleRenderPreview()
-        scheduleAutosave()
-    }
-
-    @objc private func gradientOpacityChanged() {
-        guard let slider = gradientOpacitySlider else { return }
-        layerSettings.gradient.opacity = slider.doubleValue
-        gradientOpacityValue?.stringValue = formatPercent(slider.doubleValue)
-        scheduleRenderPreview()
-        scheduleAutosave()
-    }
-
-    @objc private func gradientBlendChanged() {
-        guard let popup = gradientBlendPopup else { return }
-        let idx = popup.indexOfSelectedItem
-        if GradientBlend.allCases.indices.contains(idx) {
-            layerSettings.gradient.blend = GradientBlend.allCases[idx]
-        }
-        scheduleRenderPreview()
-        scheduleAutosave()
     }
 
     @objc private func loadBackgroundClicked() {
@@ -1537,13 +1726,12 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let counter = overlayCounter
         photoshopQueue.async { [weak self] in
             guard let self = self else { return }
-            if let out = self.overlayExporter.export(psdURL: url, counter: counter) {
-                let maxNum = WebPNumbering.existingNumbers(psdURL: url).max() ?? counter
+            if let out = self.exportPSDWebp(psdURL: url, counter: counter) {
                 DispatchQueue.main.async {
-                    self.overlayCounter = max(maxNum, counter)
+                    self.overlayCounter = out.counter
                     self.layerSettings.overlay.path = out.path
                     self.compositor.invalidateCache()
-                    self.overlayPathLabel?.stringValue = out.lastPathComponent
+                    self.overlayPathLabel?.stringValue = out.path.isEmpty ? "" : URL(fileURLWithPath: out.path).lastPathComponent
                     self.preloadLayerImages()
                     self.scheduleRenderPreview()
                     self.scheduleAutosave()
@@ -1566,13 +1754,12 @@ final class ProductionView: NSView, NSTextViewDelegate {
             DispatchQueue.main.async {
                 let counter = self.overlayCounter
                 self.photoshopQueue.async {
-                    if let out = self.overlayExporter.export(psdURL: psdURL, counter: counter) {
-                        let maxNum = WebPNumbering.existingNumbers(psdURL: psdURL).max() ?? counter
+                    if let out = self.exportPSDWebp(psdURL: psdURL, counter: counter) {
                         DispatchQueue.main.async {
-                            self.overlayCounter = max(maxNum, counter)
+                            self.overlayCounter = out.counter
                             self.layerSettings.overlay.path = out.path
                             self.compositor.invalidateCache()
-                            self.overlayPathLabel?.stringValue = out.lastPathComponent
+                            self.overlayPathLabel?.stringValue = URL(fileURLWithPath: out.path).lastPathComponent
                             self.preloadLayerImages()
                             self.scheduleRenderPreview()
                             self.scheduleAutosave()
@@ -2130,6 +2317,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
         applyAutoOrientation(firstPhotoURL: collected[0])
         restoreOverlayPSD(overlayPSDPath)
+        restoreExtraLayerPSDs()
         applyLayerSettingsToUI()
         showCurrentImage()
         updateStatus()
@@ -2374,6 +2562,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private func layerImagePaths() -> [String] {
         var paths: [String] = []
         if !layerSettings.overlay.path.isEmpty { paths.append(layerSettings.overlay.path) }
+        for extra in layerSettings.extraLayers where !extra.path.isEmpty {
+            paths.append(extra.path)
+        }
         if !layerSettings.bg5.path.isEmpty { paths.append(layerSettings.bg5.path) }
         if case .image(let p) = layerSettings.bg6, !p.isEmpty { paths.append(p) }
         return paths
@@ -2401,6 +2592,27 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
         canvasView.watermarkTransform = effectiveWatermarkTransform()
         canvasView.overlayTransform = effectiveOverlayTransform()
+
+        // Extra-layer canvas state (list order = top of list = top).
+        canvasView.extraLayerStates = layerSettings.extraLayers.map { extra in
+            var baseSize: CGSize? = nil
+            if let img = DecodedImageCache.shared.cached(extra.path), img.width > 0, img.height > 0 {
+                let base = LayerGeometry.fittedRect(canvas: canvas, imageSize: CGSize(width: img.width, height: img.height))
+                baseSize = CGSize(width: base.width * scale, height: base.height * scale)
+            }
+            return CanvasView.ExtraLayerCanvasState(
+                id: extra.id,
+                baseSize: baseSize,
+                transform: effectiveExtraLayerTransform(extra)
+            )
+        }
+    }
+
+    private func effectiveExtraLayerTransform(_ extra: ExtraLayer) -> OverlayTransform {
+        if let override = edits.extraLayerOverride(id: extra.id.uuidString, sizeKey: currentSizeKey(), fileName: currentFileName()) {
+            return override
+        }
+        return extra.transform
     }
 
     private func handleWatermarkChange(_ transform: WatermarkTransform, commit: Bool, option: Bool) {
@@ -2421,6 +2633,16 @@ final class ProductionView: NSView, NSTextViewDelegate {
             layerSettings.overlay.transform = transform
         }
         canvasView.overlayTransform = transform
+        if commit { scheduleAutosave() }
+        scheduleRenderPreview()
+    }
+
+    private func handleExtraLayerChange(id: UUID, transform: OverlayTransform, commit: Bool, option: Bool) {
+        if option {
+            edits.setExtraLayerOverride(transform, id: id.uuidString, sizeKey: currentSizeKey(), fileName: currentFileName())
+        } else if let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) {
+            layerSettings.extraLayers[idx].transform = transform
+        }
         if commit { scheduleAutosave() }
         scheduleRenderPreview()
     }
@@ -2605,6 +2827,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
                 imageCache.prime(files: files)
                 applyAutoOrientation(firstPhotoURL: urls[0])
                 restoreOverlayPSD(overlayPSDPath)
+                restoreExtraLayerPSDs()
                 applyLayerSettingsToUI()
                 showCurrentImage()
                 updateStatus()
@@ -2658,10 +2881,6 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func formatPercent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
-    }
-
-    private func formatDegrees(_ value: Double) -> String {
-        "\(Int(value.rounded()))°"
     }
 
     private func pathSummary(_ path: String, empty: String) -> String {

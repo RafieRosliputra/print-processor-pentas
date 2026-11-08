@@ -15,6 +15,7 @@ public final class InteractivePreviewRenderer {
     private var below: CGImage?
     private var above: CGImage?
     private var canvas: CGSize = .zero
+    private var imageIndex: Int = 0
 
     public init(compositor: Compositor = Compositor()) {
         self.compositor = compositor
@@ -27,6 +28,7 @@ public final class InteractivePreviewRenderer {
     /// per image + size, then again only when a static-layer setting changes.
     public func prepare(project: ProjectModel, imageIndex: Int, canvasPixelSize: CGSize) {
         self.project = project
+        self.imageIndex = imageIndex
         self.canvas = canvasPixelSize
         self.below = compositor.renderStaticBelow(project: project, imageIndex: imageIndex, canvasPixelSize: canvasPixelSize)
         self.above = compositor.renderStaticAbove(project: project, imageIndex: imageIndex, canvasPixelSize: canvasPixelSize)
@@ -55,7 +57,7 @@ public final class InteractivePreviewRenderer {
 
         let rect = CGRect(origin: .zero, size: canvas)
         if let below { ctx.draw(below, in: rect) }
-        compositor.drawPhotoInto(ctx, photo: photo, edit: edit, project: project, canvas: canvas)
+        compositor.drawPhotoInto(ctx, photo: photo, edit: edit, project: project, canvas: canvas, imageIndex: imageIndex)
         if let above { ctx.draw(above, in: rect) }
 
         return ctx.makeImage()

@@ -20,9 +20,9 @@ public struct RGBAColor: Codable, Equatable, Hashable {
     public static let clear = RGBAColor(red: 0, green: 0, blue: 0, alpha: 0)
 }
 
-/// Blend mode for the photo gradient. Mirrors the Core Graphics blend modes
-/// usable for the layer-4 gradient.
-public enum GradientBlend: String, Codable, CaseIterable {
+/// Blend mode for an extra layer. Mirrors the Core Graphics blend modes usable
+/// when compositing user layers over the subject photo.
+public enum ExtraLayerBlend: String, Codable, CaseIterable {
     case normal
     case multiply
     case screen
@@ -38,34 +38,58 @@ public enum GradientBlend: String, Codable, CaseIterable {
     }
 }
 
-/// Two-stop linear gradient drawn only inside the photo's transformed rect.
-public struct GradientSettings: Codable, Equatable {
+/// A user-added layer drawn between the subject photo (layer 4) and the overlay
+/// (layer 3). The image (PNG/WebP/JPG/PSD) is fitted to the canvas, then
+/// free-transformed; when `clipToPhoto` is on it is clipped to the photo's
+/// transformed rect (where the gradient used to be drawn).
+public struct ExtraLayer: Codable, Equatable, Identifiable {
+    public var id: UUID
+    /// Display name (defaults to the source file name).
+    public var name: String
+    /// File drawn by the compositor: the image itself for PNG/WebP/JPG, or the
+    /// newest generated `<name>-NN.webp` for a PSD source.
+    public var path: String
     public var enabled: Bool
-    public var colorA: RGBAColor
-    public var colorB: RGBAColor
-    /// Direction in degrees: 0 = left→right, 90 = bottom→top, 180 = right→left.
-    public var angle: Double
-    /// Overall gradient opacity 0…1.
+    /// Overall opacity 0…1.
     public var opacity: Double
-    public var blend: GradientBlend
+    public var blend: ExtraLayerBlend
+    /// true = draw only inside the photo's transformed rect (default).
+    public var clipToPhoto: Bool
+    /// Free-transform placement (global; a per-image override may exist).
+    public var transform: OverlayTransform
+    /// PSD source state (psdPath empty for a plain image).
+    public var psd: PSDOverlaySource
 
     public init(
+        id: UUID = UUID(),
+        name: String = "",
+        path: String = "",
         enabled: Bool = true,
-        colorA: RGBAColor = RGBAColor(red: 1, green: 1, blue: 1, alpha: 0.5),
-        colorB: RGBAColor = RGBAColor(red: 0, green: 0, blue: 0, alpha: 0),
-        angle: Double = 0,
         opacity: Double = 1,
-        blend: GradientBlend = .normal
+        blend: ExtraLayerBlend = .normal,
+        clipToPhoto: Bool = true,
+        transform: OverlayTransform = .identity,
+        psd: PSDOverlaySource = PSDOverlaySource()
     ) {
+        self.id = id
+        self.name = name
+        self.path = path
         self.enabled = enabled
-        self.colorA = colorA
-        self.colorB = colorB
-        self.angle = angle
         self.opacity = opacity
         self.blend = blend
+        self.clipToPhoto = clipToPhoto
+        self.transform = transform
+        self.psd = psd
     }
 
-    public static let defaults = GradientSettings()
+    /// A new extra layer for `path`, named after the file name (stem).
+    public static func new(path: String, name: String? = nil) -> ExtraLayer {
+        let stem = name ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        return ExtraLayer(name: stem, path: path)
+    }
+
+    /// Whether this layer is backed by a PSD source.
+    public var isPSD: Bool { !psd.psdPath.isEmpty }
 }
 
 /// Free-transform placement for the watermark, expressed as fractions of the
@@ -318,7 +342,8 @@ public struct LayerSettings: Codable, Equatable {
     public var enabled: LayerVisibility
     public var watermark: WatermarkSettings
     public var overlay: OverlaySettings
-    public var gradient: GradientSettings
+    /// User-added layers drawn between layer 4 and layer 3 (top of list = top).
+    public var extraLayers: [ExtraLayer]
     public var bg5: BackgroundSettings
     public var bg6: FinalBackground
     /// Layer-2 PSD styled text settings.
@@ -328,7 +353,7 @@ public struct LayerSettings: Codable, Equatable {
         enabled: LayerVisibility = .defaults,
         watermark: WatermarkSettings = .defaults,
         overlay: OverlaySettings = .defaults,
-        gradient: GradientSettings = .defaults,
+        extraLayers: [ExtraLayer] = [],
         bg5: BackgroundSettings = .defaults,
         bg6: FinalBackground = .defaults,
         psdText: PSDTextSettings = .defaults
@@ -336,7 +361,7 @@ public struct LayerSettings: Codable, Equatable {
         self.enabled = enabled
         self.watermark = watermark
         self.overlay = overlay
-        self.gradient = gradient
+        self.extraLayers = extraLayers
         self.bg5 = bg5
         self.bg6 = bg6
         self.psdText = psdText
@@ -347,7 +372,7 @@ public struct LayerSettings: Codable, Equatable {
     // MARK: Codable (backward-compatible with pre-psdText projects)
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, watermark, overlay, gradient, bg5, bg6, psdText
+        case enabled, watermark, overlay, extraLayers, bg5, bg6, psdText
     }
 
     public init(from decoder: Decoder) throws {
@@ -355,10 +380,14 @@ public struct LayerSettings: Codable, Equatable {
         enabled = try c.decodeIfPresent(LayerVisibility.self, forKey: .enabled) ?? .defaults
         watermark = try c.decodeIfPresent(WatermarkSettings.self, forKey: .watermark) ?? .defaults
         overlay = try c.decodeIfPresent(OverlaySettings.self, forKey: .overlay) ?? .defaults
-        gradient = try c.decodeIfPresent(GradientSettings.self, forKey: .gradient) ?? .defaults
+        extraLayers = try c.decodeIfPresent([ExtraLayer].self, forKey: .extraLayers) ?? []
         bg5 = try c.decodeIfPresent(BackgroundSettings.self, forKey: .bg5) ?? .defaults
         bg6 = try c.decodeIfPresent(FinalBackground.self, forKey: .bg6) ?? .defaults
         psdText = try c.decodeIfPresent(PSDTextSettings.self, forKey: .psdText) ?? .defaults
+        // Legacy decode shim: pre-0.0.2 projects stored a two-stop photo gradient
+        // under the `gradient` key (colours, angle, opacity, blend). The generator
+        // was removed; `gradient` is intentionally absent from CodingKeys, so the
+        // key is silently ignored and such projects still decode.
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -366,7 +395,7 @@ public struct LayerSettings: Codable, Equatable {
         try c.encode(enabled, forKey: .enabled)
         try c.encode(watermark, forKey: .watermark)
         try c.encode(overlay, forKey: .overlay)
-        try c.encode(gradient, forKey: .gradient)
+        try c.encode(extraLayers, forKey: .extraLayers)
         try c.encode(bg5, forKey: .bg5)
         try c.encode(bg6, forKey: .bg6)
         try c.encode(psdText, forKey: .psdText)

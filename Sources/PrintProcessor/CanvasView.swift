@@ -1,12 +1,14 @@
 import AppKit
 import PrintProcessorCore
 
-/// A layer (1 = watermark, 2 = PSD text, 3 = overlay) that can be selected on
-/// the canvas and free-transformed with the red box + handles.
-enum SelectedLayer {
+/// A layer that can be selected on the canvas and free-transformed with the red
+/// box + handles: 1 = watermark, 2 = PSD text, 3 = overlay, or one of the extra
+/// user layers (identified by its UUID).
+enum SelectedLayer: Equatable {
     case watermark
     case psdText
     case overlay
+    case extraLayer(UUID)
 }
 
 /// Interactive canvas. Draws the composited preview (all layers) into the paper
@@ -61,6 +63,17 @@ final class CanvasView: NSView {
         didSet { needsDisplay = true }
     }
 
+    /// Per-extra-layer canvas state (base size + current transform), in preview
+    /// space. List order matches the panel: top of list = top of stack.
+    struct ExtraLayerCanvasState {
+        let id: UUID
+        var baseSize: CGSize?
+        var transform: OverlayTransform
+    }
+    var extraLayerStates: [ExtraLayerCanvasState] = [] {
+        didSet { needsDisplay = true }
+    }
+
     // Layer 2 (PSD text) box state (normalised 0…1; nil = no PSD loaded).
     var psdTextBox: PSDTextBox? {
         didSet { needsDisplay = true; updateSelectionLayer() }
@@ -89,13 +102,16 @@ final class CanvasView: NSView {
     var onToggleNoExport: (() -> Void)?
     var onTogglePreviewFull: (() -> Void)?
 
-    /// The selection changed (nil = deselected). `1`/`3` map to the layer.
-    var onSelectionChanged: ((Int?) -> Void)?
+    /// The selection changed (nil = deselected). Carries the full selection so
+    /// the controller can also track which extra layer (if any) is selected.
+    var onSelectionChanged: ((SelectedLayer?) -> Void)?
     /// Layer-1 transform changed. `commit` = gesture finished; `option` = the
     /// Option key was held (write a per-image override).
     var onWatermarkChanged: ((WatermarkTransform, Bool, Bool) -> Void)?
     /// Layer-3 transform changed (same commit/option convention).
     var onOverlayChanged: ((OverlayTransform, Bool, Bool) -> Void)?
+    /// Extra-layer transform changed. `option` = write a per-image override.
+    var onExtraLayerChanged: ((UUID, OverlayTransform, Bool, Bool) -> Void)?
     /// Layer-2 bounding box changed. `commit` = gesture finished; `option` =
     /// Option was held (write a per-image override).
     var onPSDTextBoxChanged: ((PSDTextBox, Bool, Bool) -> Void)?
@@ -118,7 +134,7 @@ final class CanvasView: NSView {
     private var selection: SelectedLayer? {
         didSet {
             updateSelectionLayer()
-            onSelectionChanged?(selection?.layerNumber)
+            onSelectionChanged?(selection)
         }
     }
 
@@ -145,6 +161,8 @@ final class CanvasView: NSView {
     private var transformGestureStartWatermark = WatermarkTransform.identity
     private var transformGestureStartOverlay = OverlayTransform.identity
     private var transformGestureStartPSDBox = PSDTextBox.defaults
+    private var transformGestureStartExtra = OverlayTransform.identity
+    private var transformGestureExtraID: UUID?
 
     // Layer-2 box rubber-band drawing state (armed by the panel's Draw box).
     private var psdBoxDrawingEnabled = false
@@ -324,6 +342,26 @@ final class CanvasView: NSView {
         return LayerGeometry.corners(of: rect, transform: t)
     }
 
+    /// An extra layer's four drawn corners (fit + free transform), matching the
+    /// compositor's `drawExtraLayer`.
+    private func extraLayerCorners(_ state: ExtraLayerCanvasState) -> [CGPoint] {
+        guard let base = state.baseSize, base.width > 0, base.height > 0 else { return [] }
+        let s = Double(canvasOffsetScale())
+        return LayerGeometry.centeredCorners(
+            canvas: compositePixelSize,
+            baseSize: base,
+            offsetX: state.transform.offsetX * s,
+            offsetY: state.transform.offsetY * s,
+            scaleX: state.transform.scaleX,
+            scaleY: state.transform.scaleY,
+            rotationDeg: state.transform.rotationDeg
+        )
+    }
+
+    private func extraLayerState(_ id: UUID) -> ExtraLayerCanvasState? {
+        extraLayerStates.first { $0.id == id }
+    }
+
     /// The four corners of the selected layer, in canvas (composite pixel)
     /// coordinates, ordered bottom-left, bottom-right, top-right, top-left.
     private func selectionCorners() -> [CGPoint] {
@@ -331,6 +369,7 @@ final class CanvasView: NSView {
         case .overlay: return overlayCorners()
         case .watermark: return watermarkCorners()
         case .psdText: return rectCorners(psdTextBoxCanvasRect())
+        case .extraLayer(let id): return extraLayerState(id).map(extraLayerCorners) ?? []
         case nil: return []
         }
     }
@@ -603,6 +642,12 @@ final class CanvasView: NSView {
         selection = .psdText
     }
 
+    /// Select an extra layer on the canvas (shows the red box + handles).
+    func selectExtraLayer(_ id: UUID) {
+        guard !locked else { return }
+        selection = .extraLayer(id)
+    }
+
     // MARK: - Mouse (selection + layer-4 pan)
 
     override func mouseDown(with event: NSEvent) {
@@ -655,6 +700,15 @@ final class CanvasView: NSView {
             selection = .overlay
             beginTransform(.overlay, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
+        }
+        // Extra layers (below the overlay, above the photo); list order = top.
+        for state in extraLayerStates {
+            let q = extraLayerCorners(state)
+            if q.count == 4 && quadContains(screenQuad(q), screenPoint) {
+                selection = .extraLayer(state.id)
+                beginTransform(.extraLayer(state.id), mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
+                return
+            }
         }
         let watermarkQ = watermarkCorners()
         if watermarkQ.count == 4 && quadContains(screenQuad(watermarkQ), screenPoint) {
@@ -749,6 +803,12 @@ final class CanvasView: NSView {
         transformGestureStartWatermark = watermarkTransform
         transformGestureStartOverlay = overlayTransform
         transformGestureStartPSDBox = psdTextBox ?? .defaults
+        transformGestureExtraID = nil
+        transformGestureStartExtra = .identity
+        if case .extraLayer(let id) = layer {
+            transformGestureExtraID = id
+            transformGestureStartExtra = extraLayerState(id)?.transform ?? .identity
+        }
         transformGestureAnchor = scaleAnchor(for: layer)
         beginGesture()
     }
@@ -758,6 +818,7 @@ final class CanvasView: NSView {
         transformGestureOption = false
         transformGestureShift = false
         transformGestureScaleHandle = nil
+        transformGestureExtraID = nil
     }
 
     /// Whether the given scale handle is a corner or an edge midpoint.
@@ -795,6 +856,19 @@ final class CanvasView: NSView {
             )
         case .psdText:
             return transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize).center
+        case .extraLayer(let id):
+            let base = extraLayerState(id)?.baseSize ?? .zero
+            let s = canvasOffsetScale()
+            let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
+            let t = LayerGeometry.centeredTransform(
+                canvas: compositePixelSize,
+                offsetX: transformGestureStartExtra.offsetX * s,
+                offsetY: transformGestureStartExtra.offsetY * s,
+                scaleX: transformGestureStartExtra.scaleX,
+                scaleY: transformGestureStartExtra.scaleY,
+                rotationDeg: transformGestureStartExtra.rotationDeg
+            )
+            return LayerGeometry.boundingBox(of: local, transform: t).center
         }
     }
 
@@ -863,8 +937,31 @@ final class CanvasView: NSView {
             }
             psdTextBox = b.clamped()
             onPSDTextBoxChanged?(psdTextBox ?? .defaults, commit, transformGestureOption)
+
+        case .extraLayer(let id):
+            var t = transformGestureStartExtra
+            switch transformGestureMode {
+            case .move:
+                let s = Double(canvasOffsetScale())
+                t.offsetX += dx / s
+                t.offsetY += dy / s
+            case .scale:
+                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
+                    t.scaleX = clampScale(t.scaleX * fx)
+                    t.scaleY = clampScale(t.scaleY * fy)
+                }
+            case .rotate:
+                t.rotationDeg += rotateDelta(canvas: canvas)
+            }
+            updateExtraLayerTransform(id: id, transform: t)
+            onExtraLayerChanged?(id, t, commit, transformGestureOption)
         }
         updateSelectionLayer()
+    }
+
+    private func updateExtraLayerTransform(id: UUID, transform: OverlayTransform) {
+        guard let idx = extraLayerStates.firstIndex(where: { $0.id == id }) else { return }
+        extraLayerStates[idx].transform = transform
     }
 
     private func clampScale(_ v: Double) -> Double {
@@ -1169,6 +1266,7 @@ extension SelectedLayer {
         case .watermark: return 1
         case .psdText: return 2
         case .overlay: return 3
+        case .extraLayer: return 0
         }
     }
 }

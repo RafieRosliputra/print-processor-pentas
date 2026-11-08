@@ -152,6 +152,20 @@ public enum LayerGeometry {
         return corners(of: rect, transform: t)
     }
 
+    /// Extra-layer drawn corners (fit to canvas + free transform), matching the
+    /// renderer's `drawExtraLayer`. `offsetScale` converts stored paper-pixel
+    /// offsets into the requested canvas space.
+    public static func extraLayerCorners(canvas: CGSize, imageSize: CGSize,
+                                         transform: OverlayTransform, offsetScale: Double = 1) -> [CGPoint] {
+        let base = fittedRect(canvas: canvas, imageSize: imageSize)
+        return centeredCorners(canvas: canvas, baseSize: base.size,
+                               offsetX: transform.offsetX * offsetScale,
+                               offsetY: transform.offsetY * offsetScale,
+                               scaleX: transform.scaleX,
+                               scaleY: transform.scaleY,
+                               rotationDeg: transform.rotationDeg)
+    }
+
     /// Bounding rect of layer 4 (subject photo) under `edit`.
     public static func photoRect(canvas: CGSize, imageSize: CGSize, edit: ImageEdit) -> CGRect {
         let fit = fittedRect(canvas: canvas, imageSize: imageSize)
@@ -290,18 +304,24 @@ public final class Compositor {
         if ls.enabled.layer5, let image = image(atPath: ls.bg5.path) {
             ctx.draw(image, in: LayerGeometry.filledRect(canvas: canvas, imageSize: CGSize(width: image.width, height: image.height)))
         }
-        // Layer 4 — subject photo, then its gradient.
+        // Layer 4 — subject photo.
+        var photoSize: CGSize = .zero
+        var scaledPhotoEdit: ImageEdit?
         if ls.enabled.layer4, let photo = photoSource(imageIndex) {
             let edit = photoEdit(for: project, imageIndex: imageIndex)
             let scaledEdit = ImageEdit(scale: edit.scale,
                                        offsetX: edit.offsetX * offsetScale,
                                        offsetY: edit.offsetY * offsetScale,
                                        rotationDeg: edit.rotationDeg)
-            let photoSize = CGSize(width: photo.width, height: photo.height)
+            photoSize = CGSize(width: photo.width, height: photo.height)
+            scaledPhotoEdit = scaledEdit
             drawPhoto(ctx, photo, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
-            if ls.gradient.enabled {
-                drawGradient(ctx, ls.gradient, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
-            }
+        }
+        // Extra layers (between layer 4 and layer 3), drawn bottom→top so the
+        // top of the list is on top.
+        for extra in ls.extraLayers.reversed() {
+            drawExtraLayer(ctx, extra, canvas: canvas, photoSize: photoSize, photoEdit: scaledPhotoEdit,
+                           offsetScale: offsetScale, project: project, imageIndex: imageIndex)
         }
         // Layer 3 — overlay.
         if ls.enabled.layer3, let image = image(atPath: ls.overlay.path) {
@@ -393,22 +413,25 @@ public final class Compositor {
         return ctx.makeImage()
     }
 
-    /// Draw only the subject photo (and its gradient) into `ctx`, transformed by
-    /// `edit`. Static layers are NOT drawn — the caller composites cached
-    /// below/above images around this so a gesture never re-renders them.
+    /// Draw only the subject photo (and the extra layers over it) into `ctx`,
+    /// transformed by `edit`. Static layers are NOT drawn — the caller composites
+    /// cached below/above images around this so a gesture never re-renders them.
     public func drawPhotoInto(_ ctx: CGContext, photo: CGImage, edit: ImageEdit,
-                              project: ProjectModel, canvas: CGSize) {
+                              project: ProjectModel, canvas: CGSize, imageIndex: Int = 0) {
         let ls = project.layerSettings
-        guard ls.enabled.layer4 else { return }
         let offsetScale = Self.offsetScale(project: project, canvas: canvas)
         let scaledEdit = ImageEdit(scale: edit.scale,
                                    offsetX: edit.offsetX * offsetScale,
                                    offsetY: edit.offsetY * offsetScale,
                                    rotationDeg: edit.rotationDeg)
         let photoSize = CGSize(width: photo.width, height: photo.height)
-        drawPhoto(ctx, photo, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
-        if ls.gradient.enabled {
-            drawGradient(ctx, ls.gradient, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
+        if ls.enabled.layer4 {
+            drawPhoto(ctx, photo, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
+        }
+        for extra in ls.extraLayers.reversed() {
+            drawExtraLayer(ctx, extra, canvas: canvas, photoSize: photoSize,
+                           photoEdit: ls.enabled.layer4 ? scaledEdit : nil,
+                           offsetScale: offsetScale, project: project, imageIndex: imageIndex)
         }
     }
 
@@ -481,31 +504,56 @@ public final class Compositor {
         ctx.restoreGState()
     }
 
-    private func drawGradient(_ ctx: CGContext, _ gradient: GradientSettings, canvas: CGSize, photoSize: CGSize, edit: ImageEdit) {
-        let fit = LayerGeometry.fittedRect(canvas: canvas, imageSize: photoSize)
-        let local = CGRect(x: -fit.width / 2, y: -fit.height / 2, width: fit.width, height: fit.height)
+    private func drawExtraLayer(_ ctx: CGContext, _ extra: ExtraLayer, canvas: CGSize,
+                                photoSize: CGSize, photoEdit: ImageEdit?, offsetScale: Double,
+                                project: ProjectModel, imageIndex: Int) {
+        guard extra.enabled else { return }
+        guard let image = image(atPath: extra.path) else { return }
+        let imageSize = CGSize(width: image.width, height: image.height)
+        let transform = extraTransform(for: project, imageIndex: imageIndex, extra: extra)
+        let base = LayerGeometry.fittedRect(canvas: canvas, imageSize: imageSize)
+        let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
+
         ctx.saveGState()
-        ctx.translateBy(x: canvas.width / 2, y: canvas.height / 2)
-        ctx.translateBy(x: CGFloat(edit.offsetX), y: CGFloat(edit.offsetY))
-        ctx.rotate(by: CGFloat(edit.rotationDeg * .pi / 180))
-        ctx.scaleBy(x: CGFloat(edit.scale), y: CGFloat(edit.scale))
-        ctx.clip(to: local)
-
-        ctx.setBlendMode(blendMode(gradient.blend))
-        ctx.setAlpha(CGFloat(gradient.opacity))
-
-        let radius = hypot(local.width, local.height) / 2
-        let angle = gradient.angle * .pi / 180
-        let dir = CGPoint(x: cos(angle), y: sin(angle))
-        let start = CGPoint(x: -dir.x * radius, y: -dir.y * radius)
-        let end = CGPoint(x: dir.x * radius, y: dir.y * radius)
-
-        let colors = [cgColor(gradient.colorA), cgColor(gradient.colorB)] as CFArray
-        if let grad = CGGradient(colorsSpace: Self.colorSpace, colors: colors, locations: [0, 1]) {
-            ctx.drawLinearGradient(grad, start: start, end: end,
-                                   options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+        if extra.clipToPhoto, let photoEdit = photoEdit, photoSize.width > 0, photoSize.height > 0 {
+            clipToPhotoRect(ctx, canvas: canvas, photoSize: photoSize, photoEdit: photoEdit)
         }
+        ctx.translateBy(x: canvas.width / 2, y: canvas.height / 2)
+        ctx.translateBy(x: CGFloat(transform.offsetX * offsetScale), y: CGFloat(transform.offsetY * offsetScale))
+        ctx.rotate(by: CGFloat(transform.rotationDeg * .pi / 180))
+        ctx.scaleBy(x: CGFloat(transform.scaleX), y: CGFloat(transform.scaleY))
+        ctx.setBlendMode(blendMode(extra.blend))
+        ctx.setAlpha(CGFloat(extra.opacity))
+        ctx.draw(image, in: local)
         ctx.restoreGState()
+    }
+
+    /// Clip the current context to the subject photo's transformed rect (the
+    /// same quad `drawPhoto` produces), so a clipToPhoto extra layer stays inside
+    /// the photo even when the photo is panned/zoomed/rotated.
+    private func clipToPhotoRect(_ ctx: CGContext, canvas: CGSize, photoSize: CGSize, photoEdit: ImageEdit) {
+        let fit = LayerGeometry.fittedRect(canvas: canvas, imageSize: photoSize)
+        let corners = LayerGeometry.centeredCorners(canvas: canvas, baseSize: fit.size,
+                                                    offsetX: photoEdit.offsetX,
+                                                    offsetY: photoEdit.offsetY,
+                                                    scaleX: photoEdit.scale,
+                                                    scaleY: photoEdit.scale,
+                                                    rotationDeg: photoEdit.rotationDeg)
+        guard corners.count == 4 else { return }
+        ctx.beginPath()
+        ctx.move(to: corners[0])
+        for i in 1..<4 { ctx.addLine(to: corners[i]) }
+        ctx.closePath()
+        ctx.clip()
+    }
+
+    /// Effective transform for an extra layer: per-image override when present,
+    /// otherwise the layer's global transform.
+    private func extraTransform(for project: ProjectModel, imageIndex: Int, extra: ExtraLayer) -> OverlayTransform {
+        guard let size = project.selectedSize else { return extra.transform }
+        let fileName = project.files.indices.contains(imageIndex) ? project.files[imageIndex] : ""
+        return project.edits.extraLayerOverride(id: extra.id.uuidString, sizeKey: size.rawValue, fileName: fileName)
+            ?? extra.transform
     }
 
     private func drawOverlay(_ ctx: CGContext, _ image: CGImage, canvas: CGSize, overlay: OverlaySettings, offsetScale: Double) {
@@ -571,7 +619,7 @@ public final class Compositor {
                 blue: CGFloat(colour.blue), alpha: CGFloat(colour.alpha))
     }
 
-    private func blendMode(_ blend: GradientBlend) -> CGBlendMode {
+    private func blendMode(_ blend: ExtraLayerBlend) -> CGBlendMode {
         switch blend {
         case .normal: return .normal
         case .multiply: return .multiply

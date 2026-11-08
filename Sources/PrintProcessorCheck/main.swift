@@ -163,7 +163,7 @@ check(WatermarkTextProvider.defaultText(for: "Tingkatan 1C - 01.jpg") == "01",
 check(WatermarkTextProvider.defaultText(for: "no-separator.jpg") == "",
       "Watermark default text empty without \" - \" separator")
 
-// 7. LayerSettings JSON round-trip (incl. FinalBackground enum).
+// 7. LayerSettings JSON round-trip (incl. FinalBackground enum and extra layers).
 var ls = LayerSettings.defaults
 ls.enabled.layer3 = false
 ls.watermark.text = "01"
@@ -171,8 +171,12 @@ ls.watermark.transform.rotationDeg = 12.5
 ls.overlay.path = "/tmp/overlay.webp"
 ls.overlay.transform.scaleX = 0.7
 ls.overlay.transform.scaleY = 0.9
-ls.gradient.angle = 45
-ls.gradient.blend = .overlay
+ls.extraLayers = [
+    ExtraLayer(id: UUID(), name: "flare", path: "/tmp/flare.webp", enabled: true, opacity: 0.7,
+               blend: .overlay, clipToPhoto: true,
+               transform: OverlayTransform(offsetX: 5, offsetY: -3, scaleX: 0.9, scaleY: 1.1, rotationDeg: 30),
+               psd: PSDOverlaySource(psdPath: "/tmp/flare.psd", counter: 3))
+]
 ls.bg5.path = "/tmp/bg5.png"
 ls.bg6 = .image("/tmp/bg6.png")
 var layerRoundTrip = false
@@ -181,6 +185,51 @@ if let data = try? JSONEncoder().encode(ls),
     layerRoundTrip = decoded == ls
 }
 check(layerRoundTrip, "LayerSettings JSON round-trip")
+
+// 7b. ExtraLayer JSON round-trips on its own (id, blend, clip, PSD source).
+do {
+    let layer = ExtraLayer(id: UUID(), name: "badge", path: "/tmp/badge-03.webp", enabled: false,
+                           opacity: 0.4, blend: .multiply, clipToPhoto: false,
+                           transform: OverlayTransform(offsetX: 2, offsetY: 4, scaleX: 0.5, scaleY: 0.6, rotationDeg: -12),
+                           psd: PSDOverlaySource(psdPath: "/tmp/badge.psd", counter: 8))
+    if let data = try? JSONEncoder().encode(layer),
+       let decoded = try? JSONDecoder().decode(ExtraLayer.self, from: data) {
+        check(decoded == layer, "ExtraLayer JSON round-trip")
+    } else {
+        check(false, "ExtraLayer JSON round-trip decode")
+    }
+}
+
+// 7c. Legacy JSON with the removed `gradient` fields still decodes (ignored).
+do {
+    let legacy = """
+    {
+      "enabled": {"layer1": true, "layer2": true, "layer3": false, "layer4": true, "layer5": true, "layer6": true},
+      "watermark": {"text": "01", "fontName": ".SFUI-Bold", "sizeFraction": 0.04,
+                    "colour": {"red": 1, "green": 1, "blue": 1, "alpha": 1},
+                    "opacity": 0.6,
+                    "transform": {"offsetFractionX": 0.05, "offsetFractionY": 0.05,
+                                  "scaleX": 1, "scaleY": 1, "rotationDeg": 0}},
+      "overlay": {"path": "/tmp/o.webp", "fit": true,
+                  "transform": {"offsetX": 0, "offsetY": 0, "scaleX": 1, "scaleY": 1, "rotationDeg": 0}},
+      "gradient": {"enabled": true,
+                   "colorA": {"red": 1, "green": 0, "blue": 0, "alpha": 0.5},
+                   "colorB": {"red": 0, "green": 0, "blue": 1, "alpha": 0},
+                   "angle": 45, "opacity": 0.8, "blend": "overlay"},
+      "bg5": {"path": ""},
+      "bg6": {"kind": "colour", "colour": {"red": 1, "green": 1, "blue": 1, "alpha": 1}},
+      "psdText": {"path": "", "align": "centre",
+                  "box": {"x": 0.1, "y": 0.05, "width": 0.8, "height": 0.2}}
+    }
+    """
+    if let data = legacy.data(using: .utf8),
+       let decoded = try? JSONDecoder().decode(LayerSettings.self, from: data) {
+        check(decoded.extraLayers.isEmpty, "legacy gradient JSON decodes (extra layers empty)")
+        check(decoded.watermark.text == "01", "legacy gradient JSON keeps watermark fields")
+    } else {
+        check(false, "legacy gradient JSON decodes")
+    }
+}
 
 // 2 & 3. Compositor layer stacking, disabled-layer skipping, gradient clipping.
 do {
@@ -201,7 +250,6 @@ do {
     )
 
     var layerSettings = LayerSettings.defaults
-    layerSettings.gradient.enabled = false
     layerSettings.bg6 = .colour(RGBAColor(red: 1, green: 0, blue: 0))   // red
     layerSettings.overlay = overlay
 
@@ -256,27 +304,103 @@ do {
         } else {
             check(false, "Compositor: re-render after disabling photo")
         }
-
-        // Gradient (opaque magenta) affects only the photo area.
-        project.layerSettings.enabled.layer4 = true
-        project.layerSettings.gradient.enabled = true
-        project.layerSettings.gradient.colorA = RGBAColor(red: 1, green: 0, blue: 1)
-        project.layerSettings.gradient.colorB = RGBAColor(red: 1, green: 0, blue: 1)
-        project.layerSettings.gradient.opacity = 1
-        project.layerSettings.gradient.blend = .normal
-        if let gradientRender = compositor.render(project: project, imageIndex: 0,
-                                                  canvasPixelSize: canvas, photoSource: photoSource) {
-            let inPhoto = samplePixel(gradientRender, x: 600, y: 900)
-            check(isNear(inPhoto.r, 1) && isNear(inPhoto.b, 1) && isNear(inPhoto.g, 0),
-                  "Compositor: gradient colours the photo area (got \(inPhoto))")
-            let outside = samplePixel(gradientRender, x: 50, y: 50)
-            check(isNear(outside.r, 1) && isNear(outside.g, 0) && isNear(outside.b, 0),
-                  "Compositor: gradient stays inside the photo (got \(outside))")
-        } else {
-            check(false, "Compositor: gradient render")
-        }
     } else {
         check(false, "Compositor: render 1200x1800")
+    }
+}
+
+// Extra-layer compositor checks: list order (top of list = top), clipToPhoto
+// clipping, disabled-layer skipping, and drawing between photo and layer 3.
+do {
+    let canvas = CGSize(width: 1200, height: 1800)
+    // Photo: 300x300 fit => 1200x1200 centred. Green, opaque.
+    let green = makeSolidImage(width: 300, height: 300, r: 0, g: 1, b: 0)!
+    // Extra layer images are 200x200, fit => 1200x1200 (they cover the photo
+    // when centred at scale 1). We use two opaque colours and shrink them onto
+    // distinct spots so the stacking order is unambiguous.
+    let red = makeSolidImage(width: 200, height: 200, r: 1, g: 0, b: 0)!
+    let magenta = makeSolidImage(width: 200, height: 200, r: 1, g: 0, b: 1)!
+    let redPath = writeTempPNG(red, name: "check-xl-red.png")
+    let magentaPath = writeTempPNG(magenta, name: "check-xl-magenta.png")
+    defer {
+        if !redPath.isEmpty { try? FileManager.default.removeItem(atPath: redPath) }
+        if !magentaPath.isEmpty { try? FileManager.default.removeItem(atPath: magentaPath) }
+    }
+
+    // Place a 200x200 layer at the canvas centre: fit base is 1200x1200, so
+    // scale back to 200/1200 and keep offset 0.
+    let small = Double(200.0 / 1200.0)
+    // "red" (list top) sits at centre; "magenta" (list bottom) offset up-right.
+    let topLayer = ExtraLayer.new(path: redPath)
+    var top = topLayer
+    top.transform = OverlayTransform(offsetX: 0, offsetY: 0, scaleX: small, scaleY: small, rotationDeg: 0)
+    top.clipToPhoto = false
+
+    let bottomLayer = ExtraLayer.new(path: magentaPath)
+    var bottom = bottomLayer
+    bottom.transform = OverlayTransform(offsetX: 0, offsetY: 0, scaleX: small, scaleY: small, rotationDeg: 0)
+    bottom.clipToPhoto = false
+
+    var ls2 = LayerSettings.defaults
+    ls2.bg6 = .colour(RGBAColor(red: 0, green: 0, blue: 1))   // blue background
+    ls2.overlay = OverlaySettings()                            // no layer-3 image
+    ls2.extraLayers = [top, bottom]
+
+    var project = ProjectModel(
+        workingFolder: "/tmp/prints",
+        files: ["photo.jpg"],
+        currentIndex: 0,
+        selectedSize: .in4x6,
+        edits: EditStore(),
+        layerSettings: ls2
+    )
+    let compositor = Compositor()
+    let photoSource: (Int) -> CGImage? = { _ in green }
+
+    if let rendered = compositor.render(project: project, imageIndex: 0,
+                                        canvasPixelSize: canvas, photoSource: photoSource) {
+        // Both extra layers are identical size/position, so the list-top "red"
+        // must win at the centre (drawn last, on top).
+        let center = samplePixel(rendered, x: 600, y: 900)
+        check(isNear(center.r, 1) && isNear(center.g, 0) && isNear(center.b, 0),
+              "Extra layers: list-top layer drawn on top (got \(center))")
+        // Background blue shows at a far corner (no photo/extra layer there).
+        let corner = samplePixel(rendered, x: 50, y: 50)
+        check(isNear(corner.r, 0) && isNear(corner.g, 0) && isNear(corner.b, 1),
+              "Extra layers: background visible at corner (got \(corner))")
+
+        // Disable the top layer -> magenta shows at the centre.
+        project.layerSettings.extraLayers[0].enabled = false
+        if let noTop = compositor.render(project: project, imageIndex: 0,
+                                         canvasPixelSize: canvas, photoSource: photoSource) {
+            let center2 = samplePixel(noTop, x: 600, y: 900)
+            check(isNear(center2.r, 1) && isNear(center2.b, 1) && isNear(center2.g, 0),
+                  "Extra layers: disabled layer skipped (got \(center2))")
+        } else {
+            check(false, "Extra layers: re-render after disabling top layer")
+        }
+
+        // Clip-to-photo: a full-canvas layer (fit 1200x1200, scaled up to cover
+        // the whole canvas) clipped to the photo must not paint the corner, but
+        // paints the photo.
+        project.layerSettings.extraLayers = []
+        var clip = ExtraLayer.new(path: magentaPath)
+        clip.clipToPhoto = true
+        clip.transform = OverlayTransform(offsetX: 0, offsetY: 0, scaleX: 2, scaleY: 2, rotationDeg: 0)
+        project.layerSettings.extraLayers = [clip]
+        if let clipped = compositor.render(project: project, imageIndex: 0,
+                                           canvasPixelSize: canvas, photoSource: photoSource) {
+            let inPhoto = samplePixel(clipped, x: 600, y: 900)
+            check(isNear(inPhoto.r, 1) && isNear(inPhoto.b, 1) && isNear(inPhoto.g, 0),
+                  "Extra layers: clipToPhoto paints inside the photo (got \(inPhoto))")
+            let outside = samplePixel(clipped, x: 50, y: 50)
+            check(isNear(outside.r, 0) && isNear(outside.g, 0) && isNear(outside.b, 1),
+                  "Extra layers: clipToPhoto limits to the photo rect (got \(outside))")
+        } else {
+            check(false, "Extra layers: clipToPhoto render")
+        }
+    } else {
+        check(false, "Extra layers: render 1200x1800")
     }
 }
 
@@ -1106,7 +1230,6 @@ do {
 do {
     var layerSettings = LayerSettings.defaults
     layerSettings.bg6 = .colour(RGBAColor(red: 1, green: 1, blue: 1))
-    layerSettings.gradient.enabled = false
     let project = ProjectModel(
         workingFolder: "/tmp/prints",
         files: ["photo.jpg"],
@@ -1142,7 +1265,6 @@ do {
 do {
     var ls = LayerSettings.defaults
     ls.bg6 = .colour(RGBAColor(red: 1, green: 0, blue: 0))
-    ls.gradient.enabled = false
     var base = ProjectModel(workingFolder: "/tmp/prints", files: ["photo.jpg"],
                             selectedSize: .in4x6, layerSettings: ls)
     let compositor = Compositor()

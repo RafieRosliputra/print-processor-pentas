@@ -142,6 +142,41 @@ public final class WebPEncoder {
     }
 }
 
+/// PSD-overlay source state shared by layer 3 and every extra layer: the PSD
+/// file path and the never-reuse `<name>-NN.webp` counter, plus helpers to
+/// resolve the newest exported webp beside the PSD and advance the counter.
+public struct PSDOverlaySource: Codable, Equatable {
+    /// Absolute path of the PSD source ("" = not a PSD overlay).
+    public var psdPath: String
+    /// Highest `<name>-NN.webp` number ever exported (never reused); -1 = none.
+    public var counter: Int
+
+    public init(psdPath: String = "", counter: Int = -1) {
+        self.psdPath = psdPath
+        self.counter = counter
+    }
+
+    public static let none = PSDOverlaySource()
+
+    public var isPSD: Bool { !psdPath.isEmpty }
+
+    /// The newest existing `<stem>-NN.webp` beside the PSD, or nil.
+    public func newestWebpPath() -> String? {
+        guard !psdPath.isEmpty else { return nil }
+        let psdURL = URL(fileURLWithPath: psdPath)
+        guard let newest = WebPNumbering.existingNumbers(psdURL: psdURL).max() else { return nil }
+        let candidate = WebPNumbering.outputURL(psdURL: psdURL, number: newest)
+        return FileManager.default.fileExists(atPath: candidate.path) ? candidate.path : nil
+    }
+
+    /// Advance `counter` past every numbered webp now on disk beside the PSD
+    /// (used after a successful export so the number is never reused).
+    public mutating func advanceCounter(psdURL: URL) {
+        let maxNum = WebPNumbering.existingNumbers(psdURL: psdURL).max() ?? counter
+        counter = max(maxNum, counter)
+    }
+}
+
 /// Exports `<name>-NN.webp` beside a PSD from a flattened composite. The flatten
 /// and encode steps are injectable so the Check target can test numbering with a
 /// temp file and no external tools.

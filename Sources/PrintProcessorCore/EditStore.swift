@@ -8,10 +8,13 @@ import Foundation
 public struct EditStore: Equatable {
     public typealias SizeKey = String
     public typealias FileName = String
+    /// Stable identifier of an extra layer (its `UUID` description).
+    public typealias ExtraLayerID = String
 
     private var storage: [SizeKey: [FileName: ImageEdit]] = [:]
     private var watermarkStorage: [SizeKey: [FileName: WatermarkTransform]] = [:]
     private var overlayStorage: [SizeKey: [FileName: OverlayTransform]] = [:]
+    private var extraLayerStorage: [SizeKey: [ExtraLayerID: [FileName: OverlayTransform]]] = [:]
     private var psdTextStorage: [SizeKey: [FileName: String]] = [:]
     private var psdBoxStorage: [SizeKey: [FileName: PSDTextBox]] = [:]
 
@@ -49,6 +52,16 @@ public struct EditStore: Equatable {
         overlayStorage[sizeKey, default: [:]][fileName] = transform
     }
 
+    /// Per-image extra-layer transform override, or nil when unset (use the
+    /// layer's global transform).
+    public func extraLayerOverride(id: ExtraLayerID, sizeKey: SizeKey, fileName: FileName) -> OverlayTransform? {
+        extraLayerStorage[sizeKey]?[id]?[fileName]
+    }
+
+    public mutating func setExtraLayerOverride(_ transform: OverlayTransform, id: ExtraLayerID, sizeKey: SizeKey, fileName: FileName) {
+        extraLayerStorage[sizeKey, default: [:]][id, default: [:]][fileName] = transform
+    }
+
     /// Per-image manual layer-2 text override, or nil when unset (use list/scan).
     public func manualText(sizeKey: SizeKey, fileName: FileName) -> String? {
         psdTextStorage[sizeKey]?[fileName]
@@ -76,6 +89,7 @@ public struct EditStore: Equatable {
         var keys = Set(storage.keys)
         keys.formUnion(watermarkStorage.keys)
         keys.formUnion(overlayStorage.keys)
+        keys.formUnion(extraLayerStorage.keys)
         keys.formUnion(psdTextStorage.keys)
         keys.formUnion(psdBoxStorage.keys)
         return Array(keys)
@@ -121,6 +135,7 @@ extension EditStore: Codable {
         case storage
         case watermarkStorage
         case overlayStorage
+        case extraLayerStorage
         case psdTextStorage
         case psdBoxStorage
     }
@@ -130,6 +145,7 @@ extension EditStore: Codable {
         storage = try c.decodeIfPresent([SizeKey: [FileName: ImageEdit]].self, forKey: .storage) ?? [:]
         watermarkStorage = try c.decodeIfPresent([SizeKey: [FileName: WatermarkTransform]].self, forKey: .watermarkStorage) ?? [:]
         overlayStorage = try c.decodeIfPresent([SizeKey: [FileName: OverlayTransform]].self, forKey: .overlayStorage) ?? [:]
+        extraLayerStorage = try c.decodeIfPresent([SizeKey: [ExtraLayerID: [FileName: OverlayTransform]]].self, forKey: .extraLayerStorage) ?? [:]
         psdTextStorage = try c.decodeIfPresent([SizeKey: [FileName: String]].self, forKey: .psdTextStorage) ?? [:]
         psdBoxStorage = try c.decodeIfPresent([SizeKey: [FileName: PSDTextBox]].self, forKey: .psdBoxStorage) ?? [:]
     }
@@ -139,6 +155,7 @@ extension EditStore: Codable {
         try c.encode(storage, forKey: .storage)
         try c.encode(watermarkStorage, forKey: .watermarkStorage)
         try c.encode(overlayStorage, forKey: .overlayStorage)
+        try c.encode(extraLayerStorage, forKey: .extraLayerStorage)
         try c.encode(psdTextStorage, forKey: .psdTextStorage)
         try c.encode(psdBoxStorage, forKey: .psdBoxStorage)
     }

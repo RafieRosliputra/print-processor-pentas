@@ -46,24 +46,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Window
 
     private func buildWindow() {
-        let content = makeContent()
+        let visible = (NSScreen.screens.first ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
+            contentRect: visible,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "PrintProcessor"
         window.minSize = NSSize(width: 1100, height: 700)
-        window.contentView = content
-        window.center()
+
+        // The auto-layout content lives inside a frame-driven container. Making the constraint
+        // based content the window's contentView let AppKit shrink the window to its fitting
+        // size (0 wide), so the window never appeared.
+        let container = NSView(frame: NSRect(origin: .zero, size: visible.size))
+        let content = makeContent()
+        content.translatesAutoresizingMaskIntoConstraints = true
+        content.frame = container.bounds
+        content.autoresizingMask = [.width, .height]
+        container.addSubview(content)
+        window.contentView = container
+
+        // Maximised to the visible screen area (NOT fullscreen).
+        window.setFrame(visible, display: true)
         window.makeKeyAndOrderFront(nil)
 
-        // Maximised via zoom (fills the screen), NOT fullscreen.
-        window.zoom(nil)
-
         self.window = window
+        if ProcessInfo.processInfo.environment["PP_DEBUG"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak window] in
+                guard let w = window else { return }
+                let t = "frame=\(w.frame) content=\(w.contentView?.frame ?? .zero) visible=\(w.isVisible) key=\(w.isKeyWindow) screen=\(String(describing: w.screen?.frame))"
+                try? t.write(toFile: "/tmp/pp-window.txt", atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     private func makeContent() -> NSView {

@@ -399,6 +399,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         ])
 
         let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         scroll.documentView = document

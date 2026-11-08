@@ -2269,6 +2269,17 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     // MARK: - Import
 
+    /// Files handed over by macOS (dropped on the Dock icon, "Open With", `open -a`).
+    func openExternalFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if selectedSize == nil {
+            statusLabel.textColor = .systemOrange
+            statusLabel.stringValue = "Pick a paper size first, then drop the photos again."
+            return
+        }
+        importFiles(urls)
+    }
+
     private func importFiles(_ urls: [URL]) {
         // Route dropped .psd files to a PSD layer (2 if its section is focused,
         // otherwise 3; ask when ambiguous) instead of treating them as photos.

@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tabView: NSTabView!
     private var segmented: NSSegmentedControl!
     private var settingsView: SettingsView!
+    private var production: ProductionView?
+    private var pendingOpenURLs: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
@@ -14,6 +16,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         buildWindow()
         NSApp.activate(ignoringOtherApps: true)
+        if !pendingOpenURLs.isEmpty {
+            let urls = pendingOpenURLs
+            pendingOpenURLs = []
+            production?.openExternalFiles(urls)
+        }
+    }
+
+    /// Dock-icon drops, Finder "Open With" and `open -a` arrive here. Without this handler
+    /// AppKit shows a modal "could not be opened" alert that blocks the whole window.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        if let production = production {
+            production.openExternalFiles(urls)
+            window?.makeKeyAndOrderFront(nil)
+        } else {
+            pendingOpenURLs.append(contentsOf: urls)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -89,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         root.layer?.backgroundColor = NSColor.panel.cgColor
 
         let production = ProductionView()
+        self.production = production
         let shortcuts = ShortcutsView()
         settingsView = SettingsView()
 

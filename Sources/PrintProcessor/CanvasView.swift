@@ -74,6 +74,11 @@ final class CanvasView: NSView {
     var onEdit: ((ImageEdit, Bool, GlobalEditScope) -> Void)?
     /// A continuous layer-4 gesture just started — record an undo baseline.
     var onGestureBegan: (() -> Void)?
+
+    /// Whether the current photo is flagged "NO EXPORT" (canvas-only visual).
+    var noExport: Bool = false {
+        didSet { updateNoExportOverlay() }
+    }
     var onNextFile: (() -> Void)?
     var onPreviousFile: (() -> Void)?
     var onUndo: (() -> Void)?
@@ -81,6 +86,8 @@ final class CanvasView: NSView {
     var onRender: (() -> Void)?
     var onProcess: (() -> Void)?
     var onDropFiles: (([URL]) -> Void)?
+    var onToggleNoExport: (() -> Void)?
+    var onTogglePreviewFull: (() -> Void)?
 
     /// The selection changed (nil = deselected). `1`/`3` map to the layer.
     var onSelectionChanged: ((Int?) -> Void)?
@@ -102,6 +109,11 @@ final class CanvasView: NSView {
     private let selectionLayer = CAShapeLayer()
     private let hoverLayer = CAShapeLayer()
     private let hintLabel = NSTextField(labelWithString: "")
+
+    // "NO EXPORT" canvas-only overlay (never part of the rendered output).
+    private let noExportDimLayer = CALayer()
+    private let noExportXLayer = CAShapeLayer()
+    private let noExportLabel = PassthroughLabel()
 
     private var selection: SelectedLayer? {
         didSet {
@@ -178,6 +190,25 @@ final class CanvasView: NSView {
         hoverLayer.lineWidth = 2
         layer?.addSublayer(hoverLayer)
 
+        noExportDimLayer.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+        layer?.addSublayer(noExportDimLayer)
+        noExportXLayer.strokeColor = NSColor(hex: "#FF3B30").cgColor
+        noExportXLayer.lineWidth = 8
+        noExportXLayer.lineCap = .round
+        noExportXLayer.fillColor = nil
+        layer?.addSublayer(noExportXLayer)
+
+        noExportLabel.stringValue = "NO EXPORT"
+        noExportLabel.font = NSFont.boldSystemFont(ofSize: 28)
+        noExportLabel.textColor = NSColor(hex: "#FF3B30")
+        noExportLabel.alignment = .center
+        noExportLabel.isEditable = false
+        noExportLabel.isSelectable = false
+        noExportLabel.drawsBackground = false
+        noExportLabel.isBezeled = false
+        addSubview(noExportLabel)
+        updateNoExportOverlay()
+
         hintLabel.font = NSFont.systemFont(ofSize: 15, weight: .medium)
         hintLabel.textColor = .dimText
         hintLabel.alignment = .center
@@ -214,6 +245,7 @@ final class CanvasView: NSView {
         compositeLayer.frame = paperLayer.bounds
         updateSelectionLayer()
         updateHoverLayer()
+        updateNoExportOverlay()
     }
 
     /// The paper rectangle fitted into the view bounds.
@@ -447,6 +479,28 @@ final class CanvasView: NSView {
         } else {
             hintLabel.isHidden = true
         }
+    }
+
+    private func updateNoExportOverlay() {
+        let rect = paperRect()
+        noExportDimLayer.frame = rect
+        noExportDimLayer.isHidden = !noExport
+
+        noExportXLayer.frame = rect
+        if noExport {
+            let p = CGMutablePath()
+            p.move(to: CGPoint(x: 0, y: 0))
+            p.addLine(to: CGPoint(x: rect.width, y: rect.height))
+            p.move(to: CGPoint(x: rect.width, y: 0))
+            p.addLine(to: CGPoint(x: 0, y: rect.height))
+            noExportXLayer.path = p
+        } else {
+            noExportXLayer.path = nil
+        }
+        noExportXLayer.isHidden = !noExport
+
+        noExportLabel.frame = CGRect(x: rect.minX, y: rect.midY - 22, width: rect.width, height: 44)
+        noExportLabel.isHidden = !noExport
     }
 
     private func updateGlow() {
@@ -965,6 +1019,16 @@ final class CanvasView: NSView {
             isRDown = true
             return
         }
+        // NO EXPORT (X by default, live-rebindable).
+        if let s = store.entry(.noExport), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onToggleNoExport?()
+            return
+        }
+        // Preview full (P by default, live-rebindable).
+        if let s = store.entry(.previewFull), ShortcutStore.matches(event, keyCode: s.keyCode, modifiers: s.modifiers) {
+            onTogglePreviewFull?()
+            return
+        }
         // Nudge (arrow keys, fixed 1 px / Shift 10 px).
         let shift = event.modifierFlags.contains(.shift)
         switch event.keyCode {
@@ -1106,6 +1170,14 @@ extension SelectedLayer {
         case .psdText: return 2
         case .overlay: return 3
         }
+    }
+}
+
+/// A label that never intercepts mouse events, so the canvas-only "NO EXPORT"
+/// overlay does not block pan/zoom/rotate on flagged photos.
+private final class PassthroughLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
     }
 }
 

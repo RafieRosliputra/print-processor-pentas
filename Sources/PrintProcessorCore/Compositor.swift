@@ -330,6 +330,88 @@ public final class Compositor {
         return ctx.makeImage()
     }
 
+    // MARK: - Interactive preview (fast path)
+
+    /// Create an 8-bit premultiplied sRGB context for `canvas`.
+    private static func makeContext(_ canvas: CGSize) -> CGContext? {
+        let width = Int(canvas.width.rounded())
+        let height = Int(canvas.height.rounded())
+        guard width > 0, height > 0 else { return nil }
+        return CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    }
+
+    /// Pre-render the static layers *below* the subject photo (layers 6 and 5)
+    /// into a cached image. Rebuild only when those settings change.
+    public func renderStaticBelow(project: ProjectModel, imageIndex: Int, canvasPixelSize: CGSize) -> CGImage? {
+        guard let ctx = Self.makeContext(canvasPixelSize) else { return nil }
+        let ls = project.layerSettings
+        let canvas = canvasPixelSize
+        if ls.enabled.layer6 {
+            drawFinalBackground(ctx, ls.bg6, canvas)
+        }
+        if ls.enabled.layer5, let image = image(atPath: ls.bg5.path) {
+            ctx.draw(image, in: LayerGeometry.filledRect(canvas: canvas, imageSize: CGSize(width: image.width, height: image.height)))
+        }
+        return ctx.makeImage()
+    }
+
+    /// Pre-render the static layers *above* the subject photo (layers 3, 2 and 1)
+    /// into a cached image. Rebuild only when those settings change.
+    public func renderStaticAbove(project: ProjectModel, imageIndex: Int, canvasPixelSize: CGSize) -> CGImage? {
+        guard let ctx = Self.makeContext(canvasPixelSize) else { return nil }
+        let ls = project.layerSettings
+        let canvas = canvasPixelSize
+        let offsetScale = Self.offsetScale(project: project, canvas: canvas)
+        if ls.enabled.layer3, let image = image(atPath: ls.overlay.path) {
+            drawOverlay(ctx, image, canvas: canvas, overlay: ls.overlay, offsetScale: offsetScale)
+        }
+        if ls.enabled.layer2, let image = layer2Image {
+            let boxRect = layer2Box.pixelRect(canvas: canvas)
+            let drawRect = PSDTextLayout.fittedRect(
+                box: boxRect,
+                imageSize: CGSize(width: image.width, height: image.height),
+                align: layer2Align
+            )
+            ctx.draw(image, in: drawRect)
+        }
+        if ls.enabled.layer1 {
+            var watermark = ls.watermark
+            if watermark.text.isEmpty {
+                let fileName = project.files.indices.contains(imageIndex) ? project.files[imageIndex] : ""
+                watermark.text = resolveText(project: project, fileName: fileName).watermark
+            }
+            drawWatermark(ctx, watermark, canvas: canvas)
+        }
+        return ctx.makeImage()
+    }
+
+    /// Draw only the subject photo (and its gradient) into `ctx`, transformed by
+    /// `edit`. Static layers are NOT drawn — the caller composites cached
+    /// below/above images around this so a gesture never re-renders them.
+    public func drawPhotoInto(_ ctx: CGContext, photo: CGImage, edit: ImageEdit,
+                              project: ProjectModel, canvas: CGSize) {
+        let ls = project.layerSettings
+        guard ls.enabled.layer4 else { return }
+        let offsetScale = Self.offsetScale(project: project, canvas: canvas)
+        let scaledEdit = ImageEdit(scale: edit.scale,
+                                   offsetX: edit.offsetX * offsetScale,
+                                   offsetY: edit.offsetY * offsetScale,
+                                   rotationDeg: edit.rotationDeg)
+        let photoSize = CGSize(width: photo.width, height: photo.height)
+        drawPhoto(ctx, photo, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
+        if ls.gradient.enabled {
+            drawGradient(ctx, ls.gradient, canvas: canvas, photoSize: photoSize, edit: scaledEdit)
+        }
+    }
+
     // MARK: - Text resolution
 
     private func resolveText(project: ProjectModel, fileName: String) -> TextResolution {

@@ -16,6 +16,8 @@ enum ShortcutID: String, CaseIterable, Codable {
     case render
     case process
     case openPhotoshop
+    case noExport
+    case previewFull
 }
 
 /// One shortcut row: identity, description, default binding, and current binding.
@@ -89,6 +91,8 @@ final class ShortcutStore {
             key("render", "Render (Quick Look)", "Render this photo at full size to Quick Look", code: 15, mods: cmd, display: "⌘R"),
             key("process", "Process / Save", "Export every photo as JPG/WebP", code: 35, mods: cmd, display: "⌘P"),
             mouse("openPhotoshop", "Open in Photoshop", "Middle-click a layer element", display: "Middle-click"),
+            key("noExport", "NO EXPORT", "Toggle the NO EXPORT flag on the current photo", code: 7, mods: 0, display: "X"),
+            key("previewFull", "Preview full", "Toggle a full-resolution preview of the canvas", code: 35, mods: 0, display: "P"),
         ]
     }
 

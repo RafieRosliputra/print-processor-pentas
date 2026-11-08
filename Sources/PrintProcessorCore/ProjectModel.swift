@@ -25,6 +25,9 @@ public struct ProjectModel: Equatable {
     public var overlayPSDPath: String
     /// Highest layer-2 webp number ever exported (never reused); -1 = none yet.
     public var psdTextCounter: Int
+    /// File names (basenames) flagged "NO EXPORT". Shared across paper sizes;
+    /// the export job skips these photos but the canvas still shows them.
+    public var noExport: Set<String>
 
     public init(
         workingFolder: String,
@@ -36,7 +39,8 @@ public struct ProjectModel: Equatable {
         psdTextList: [String: String] = [:],
         overlayCounter: Int = -1,
         overlayPSDPath: String = "",
-        psdTextCounter: Int = -1
+        psdTextCounter: Int = -1,
+        noExport: Set<String> = []
     ) {
         self.workingFolder = workingFolder
         self.files = files
@@ -48,6 +52,7 @@ public struct ProjectModel: Equatable {
         self.overlayCounter = overlayCounter
         self.overlayPSDPath = overlayPSDPath
         self.psdTextCounter = psdTextCounter
+        self.noExport = noExport
     }
 
     /// Absolute URL of the project JSON inside the working folder.
@@ -109,6 +114,7 @@ extension ProjectModel: Codable {
         case overlayCounter
         case overlayPSDPath
         case psdTextCounter
+        case noExport
     }
 
     public init(from decoder: Decoder) throws {
@@ -123,6 +129,7 @@ extension ProjectModel: Codable {
         overlayCounter = try c.decodeIfPresent(Int.self, forKey: .overlayCounter) ?? -1
         overlayPSDPath = try c.decodeIfPresent(String.self, forKey: .overlayPSDPath) ?? ""
         psdTextCounter = try c.decodeIfPresent(Int.self, forKey: .psdTextCounter) ?? -1
+        noExport = try c.decodeIfPresent(Set<String>.self, forKey: .noExport) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -137,5 +144,6 @@ extension ProjectModel: Codable {
         try c.encode(overlayCounter, forKey: .overlayCounter)
         try c.encode(overlayPSDPath, forKey: .overlayPSDPath)
         try c.encode(psdTextCounter, forKey: .psdTextCounter)
+        try c.encode(noExport, forKey: .noExport)
     }
 }

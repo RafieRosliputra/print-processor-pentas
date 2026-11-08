@@ -99,6 +99,30 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var orientationButton: NSButton?
     private var rotationField: RotationStepField?
 
+    // NO EXPORT flag (set of flagged file names) + Preview full toggle.
+    private var noExport: Set<String> = []
+    private var previewFull = false
+    private var noExportButton: NSButton?
+    private var previewFullButton: NSButton?
+
+    // Interactive low-res preview: static layers cached, photo transformed per frame.
+    private let interactiveRenderer: InteractivePreviewRenderer
+    private var staticPreviewKey: StaticPreviewKey?
+    private var fullRenderGeneration = 0
+
+    /// Identifies the static-layer inputs so the fast preview re-renders its
+    /// cached below/above layers only when one of them actually changes.
+    private struct StaticPreviewKey: Equatable {
+        let sizeKey: String
+        let orientation: CanvasOrientation
+        let index: Int
+        let layers: LayerSettings
+        let scanMode: String
+        let psdTextList: [String: String]
+        let layer2Box: PSDTextBox
+        let layer2Image: ObjectIdentifier?
+    }
+
     // Export UI + state.
     private var exportJPGCheckbox: NSButton?
     private var exportWebPCheckbox: NSButton?
@@ -137,6 +161,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     override init(frame frameRect: NSRect) {
         self.statusLabel = makeLabel("Select a paper size to begin.", size: 12, weight: .regular, color: .dimText)
         self.imageCache = ImageCache(ramCapBytes: AppSettings.load().cacheRAMCapMB * 1024 * 1024)
+        self.interactiveRenderer = InteractivePreviewRenderer(compositor: compositor)
         super.init(frame: frameRect)
         build()
         canvasView.settings = settings
@@ -224,6 +249,15 @@ final class ProductionView: NSView, NSTextViewDelegate {
             sizeStack.addArrangedSubview(button)
         }
 
+        let previewFullButton = NSButton(title: "Preview full", target: self, action: #selector(previewFullClicked))
+        previewFullButton.setButtonType(.pushOnPushOff)
+        previewFullButton.bezelStyle = .rounded
+        previewFullButton.controlSize = .regular
+        previewFullButton.state = .off
+        let previewFullShortcut = ShortcutStore.shared.entry(.previewFull)?.display ?? "P"
+        previewFullButton.toolTip = "Preview full — high-resolution render of the canvas (any edit gesture returns to fast preview). Shortcut: \(previewFullShortcut)"
+        self.previewFullButton = previewFullButton
+
         let processButton = NSButton(title: "Process", target: self, action: #selector(processClicked))
         processButton.bezelStyle = .rounded
         processButton.controlSize = .regular
@@ -240,7 +274,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         cancelButton.isHidden = true
         self.cancelButton = cancelButton
 
-        let controlsRow = NSStackView(views: [sizeStack, processButton, cancelButton])
+        let controlsRow = NSStackView(views: [sizeStack, previewFullButton, processButton, cancelButton])
         controlsRow.orientation = .horizontal
         controlsRow.alignment = .centerY
         controlsRow.spacing = 10
@@ -315,6 +349,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
         }
         canvasView.onRender = { [weak self] in self?.renderClicked() }
         canvasView.onProcess = { [weak self] in self?.processClicked() }
+        canvasView.onToggleNoExport = { [weak self] in self?.toggleNoExport() }
+        canvasView.onTogglePreviewFull = { [weak self] in self?.togglePreviewFull() }
 
         let options = makeOptionsPanel()
 
@@ -330,8 +366,18 @@ final class ProductionView: NSView, NSTextViewDelegate {
         renderButton.translatesAutoresizingMaskIntoConstraints = false
         self.renderButton = renderButton
 
+        let noExportButton = NSButton(title: "NO EXPORT", target: self, action: #selector(noExportClicked))
+        noExportButton.setButtonType(.pushOnPushOff)
+        noExportButton.bezelStyle = .rounded
+        noExportButton.controlSize = .regular
+        let noExportShortcut = ShortcutStore.shared.entry(.noExport)?.display ?? "X"
+        noExportButton.toolTip = "NO EXPORT — flag the current photo so export skips it (canvas shows a red X). Shortcut: \(noExportShortcut)"
+        noExportButton.translatesAutoresizingMaskIntoConstraints = false
+        self.noExportButton = noExportButton
+
         left.addSubview(canvasView)
         left.addSubview(renderButton)
+        left.addSubview(noExportButton)
         row.addSubview(left)
         row.addSubview(options)
 
@@ -349,6 +395,11 @@ final class ProductionView: NSView, NSTextViewDelegate {
             renderButton.leadingAnchor.constraint(equalTo: left.leadingAnchor, constant: 12),
             renderButton.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -8),
             renderButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 90),
+
+            noExportButton.topAnchor.constraint(equalTo: canvasView.bottomAnchor, constant: 6),
+            noExportButton.leadingAnchor.constraint(equalTo: renderButton.trailingAnchor, constant: 8),
+            noExportButton.bottomAnchor.constraint(equalTo: left.bottomAnchor, constant: -8),
+            noExportButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 100),
 
             options.topAnchor.constraint(equalTo: row.topAnchor),
             options.trailingAnchor.constraint(equalTo: row.trailingAnchor),
@@ -1647,6 +1698,51 @@ final class ProductionView: NSView, NSTextViewDelegate {
         selectSize(size)
     }
 
+    @objc private func noExportClicked() {
+        toggleNoExport()
+    }
+
+    @objc private func previewFullClicked() {
+        togglePreviewFull()
+    }
+
+    /// Toggle the "NO EXPORT" flag on the current photo (canvas-only visual,
+    /// export skips it). Not undoable (Cmd+Z does not touch it).
+    private func toggleNoExport() {
+        guard let name = currentFileURL()?.lastPathComponent, !name.isEmpty else { return }
+        if noExport.contains(name) {
+            noExport.remove(name)
+        } else {
+            noExport.insert(name)
+        }
+        syncNoExportUI()
+        scheduleAutosave()
+    }
+
+    /// Sync the NO EXPORT button + canvas overlay to the current photo's flag.
+    private func syncNoExportUI() {
+        let name = currentFileURL()?.lastPathComponent ?? ""
+        let flagged = noExport.contains(name)
+        noExportButton?.state = flagged ? .on : .off
+        noExportButton?.bezelColor = flagged ? .systemRed : nil
+        noExportButton?.contentTintColor = flagged ? .white : .labelColor
+        canvasView.noExport = flagged
+        updateStatus()
+    }
+
+    private func togglePreviewFull() {
+        setPreviewFull(!previewFull)
+    }
+
+    /// Turn the high-resolution preview on/off. Any edit gesture turns it off.
+    private func setPreviewFull(_ on: Bool) {
+        previewFull = on
+        previewFullButton?.state = on ? .on : .off
+        previewFullButton?.bezelColor = on ? .glow : nil
+        previewFullButton?.contentTintColor = on ? .black : .labelColor
+        renderPreview()
+    }
+
     @objc private func processClicked() {
         guard let size = selectedSize else {
             statusLabel.textColor = .systemRed
@@ -1708,7 +1804,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
                 c.scanMode = scanMode
                 return c.render(project: project, imageIndex: index, canvasPixelSize: canvasSize,
                                 photoSource: { _ in original })
-            }
+            },
+            noExport: noExport
         )
 
         // Resolve every collision before any work starts.
@@ -1796,11 +1893,12 @@ final class ProductionView: NSView, NSTextViewDelegate {
         }
 
         var parts: [String] = []
+        let skippedSuffix = summary.skipped > 0 ? " · \(summary.skipped) skipped" : ""
         if summary.jpgWritten > 0 || settings.export.exportJPG {
-            parts.append("JPG – \(summary.jpgWritten) files")
+            parts.append("JPG – \(summary.jpgWritten) files\(skippedSuffix)")
         }
         if summary.webpWritten > 0 || settings.export.exportWebP {
-            parts.append("WebP – \(summary.webpWritten) files")
+            parts.append("WebP – \(summary.webpWritten) files\(skippedSuffix)")
         }
         if summary.failed > 0 {
             statusLabel.textColor = .systemRed
@@ -2011,6 +2109,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
             overlayCounter = existing.overlayCounter
             overlayPSDPath = existing.overlayPSDPath
             psdTextCounter = existing.psdTextCounter
+            noExport = existing.noExport
         } else {
             edits = EditStore()
             layerSettings = .defaults
@@ -2018,6 +2117,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
             overlayCounter = -1
             overlayPSDPath = ""
             psdTextCounter = -1
+            noExport = []
         }
 
         files = collected
@@ -2102,6 +2202,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         guard let url = currentFileURL() else {
             photoPreview = nil
             canvasView.compositedImage = nil
+            canvasView.noExport = false
             updateStatus()
             return
         }
@@ -2114,7 +2215,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         scheduleLayer2Render()
         preloadLayerImages()
         loadPreview(for: url)
-        updateStatus()
+        syncNoExportUI()
     }
 
     private func updateWatermarkPlaceholder() {
@@ -2153,7 +2254,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private func previewPixelSize() -> CGSize {
         let canvas = canvasPixelSize()
         guard canvas.width > 0, canvas.height > 0 else { return .zero }
-        let cap: CGFloat = 1600
+        let cap: CGFloat = 1000
         let scale = min(1, cap / max(canvas.width, canvas.height))
         return CGSize(width: (canvas.width * scale).rounded(), height: (canvas.height * scale).rounded())
     }
@@ -2170,16 +2271,69 @@ final class ProductionView: NSView, NSTextViewDelegate {
             canvasView.compositedImage = nil
             return
         }
+        if previewFull {
+            renderFullPreview()
+            return
+        }
         let preview = previewPixelSize()
         let project = makeProjectModel()
         compositor.layer2Box = effectivePSDTextBox()
         compositor.layer2Align = layerSettings.psdText.align
         compositor.scanMode = settings.scanMode
-        let image = compositor.render(project: project, imageIndex: currentIndex, canvasPixelSize: preview,
-                                      photoSource: { [weak self] _ in self?.photoPreview })
+        let key = StaticPreviewKey(
+            sizeKey: currentSizeKey(),
+            orientation: orientation,
+            index: currentIndex,
+            layers: layerSettings,
+            scanMode: settings.scanMode,
+            psdTextList: psdTextList,
+            layer2Box: effectivePSDTextBox(),
+            layer2Image: compositor.layer2Image.map { ObjectIdentifier($0) }
+        )
+        if staticPreviewKey != key {
+            staticPreviewKey = key
+            interactiveRenderer.prepare(project: project, imageIndex: currentIndex, canvasPixelSize: preview)
+        }
+        let image = interactiveRenderer.renderFrame(edit: currentEdit(), photo: photoPreview!)
         canvasView.compositedImage = image
         canvasView.compositePixelSize = preview
         updateLayerSelectionState()
+    }
+
+    /// Full-resolution preview: render at canvas pixel size from the ORIGINAL
+    /// (never the cached preview). Used only by the "Preview full" toggle; any
+    /// edit gesture turns it off and returns to the fast low-res path.
+    private func renderFullPreview() {
+        guard let url = currentFileURL() else { return }
+        let canvas = canvasPixelSize()
+        guard canvas.width > 0, canvas.height > 0 else { return }
+        fullRenderGeneration += 1
+        let gen = fullRenderGeneration
+        let project = makeProjectModel()
+        let layer2Image = compositor.layer2Image
+        let layer2Box = effectivePSDTextBox()
+        let layer2Align = layerSettings.psdText.align
+        let scanMode = settings.scanMode
+        let cache = imageCache
+        let index = currentIndex
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            guard let original = cache.loadOriginal(url: url) else { return }
+            let c = Compositor()
+            c.layer2Image = layer2Image
+            c.layer2Box = layer2Box
+            c.layer2Align = layer2Align
+            c.scanMode = scanMode
+            guard let image = c.render(project: project, imageIndex: index, canvasPixelSize: canvas,
+                                       photoSource: { _ in original }) else { return }
+            DispatchQueue.main.async {
+                guard gen == self.fullRenderGeneration, self.previewFull, index == self.currentIndex else { return }
+                self.canvasView.compositedImage = image
+                self.canvasView.compositePixelSize = canvas
+                self.updateLayerSelectionState()
+            }
+        }
     }
 
     // MARK: - Layer 1 / 3 selection state
@@ -2274,6 +2428,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
     // MARK: - Edit handling / undo
 
     private func handleGestureBegan() {
+        // Any edit gesture returns from full preview to the fast low-res mode.
+        if previewFull { setPreviewFull(false) }
         guard let key = currentKey() else { return }
         gestureBaseline = lastEdit ?? edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
     }
@@ -2364,7 +2520,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
         }
         statusLabel.textColor = .dimText
         let name = currentFileURL()?.lastPathComponent ?? ""
-        statusLabel.stringValue = "\(currentIndex + 1) / \(files.count)  \(name)"
+        let flagged = noExport.contains(name) ? "  (NO EXPORT)" : ""
+        statusLabel.stringValue = "\(currentIndex + 1) / \(files.count)  \(name)\(flagged)"
     }
 
     // MARK: - Project persistence
@@ -2380,7 +2537,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
             psdTextList: psdTextList,
             overlayCounter: overlayCounter,
             overlayPSDPath: overlayPSDPath,
-            psdTextCounter: psdTextCounter
+            psdTextCounter: psdTextCounter,
+            noExport: noExport
         )
     }
 
@@ -2440,6 +2598,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
                 overlayCounter = model.overlayCounter
                 overlayPSDPath = model.overlayPSDPath
                 psdTextCounter = model.psdTextCounter
+                noExport = model.noExport
                 selectedSize = model.selectedSize
                 syncSizeButtons()
                 applyOrientationToCanvas()
@@ -2469,6 +2628,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         overlayCounter = -1
         overlayPSDPath = ""
         psdTextCounter = -1
+        noExport = []
         selectedSize = nil
         syncSizeButtons()
         applyOrientationToCanvas()

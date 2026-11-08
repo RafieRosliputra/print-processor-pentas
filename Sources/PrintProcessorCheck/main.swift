@@ -1053,6 +1053,115 @@ do {
     check(near, "watermark corners bounding box matches watermarkRect")
 }
 
+// MARK: - NO EXPORT + Preview full + interactive fast path
+
+// 1. ProjectModel noExport round-trips.
+do {
+    var model = ProjectModel(workingFolder: "/tmp/prints", files: ["a.jpg", "b.jpg", "c.jpg"], selectedSize: .in4x6)
+    model.noExport = ["a.jpg", "c.jpg"]
+    if let data = try? JSONEncoder().encode(model),
+       let decoded = try? JSONDecoder().decode(ProjectModel.self, from: data) {
+        check(decoded == model, "ProjectModel round-trips noExport set")
+        check(decoded.noExport == ["a.jpg", "c.jpg"], "noExport persists file names")
+    } else {
+        check(false, "ProjectModel noExport round-trip decode")
+    }
+}
+
+// 2. ExportJob skips flagged files and reports skipped.
+do {
+    let tmp = makeTempDir("noexport")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    var files: [URL] = []
+    for i in 0..<5 {
+        let u = URL(fileURLWithPath: tmp).appendingPathComponent("\(i).png")
+        _ = writePNG(makeSolidImage(width: 40, height: 60, r: 0, g: 1, b: 0, a: 1)!, to: u)
+        files.append(u)
+    }
+    let job = ExportJob(
+        files: files,
+        formats: [.jpg],
+        exportRoot: URL(fileURLWithPath: tmp),
+        settings: ExportSettings(exportJPG: true, exportWebP: false),
+        paperPixelSize: CGSize(width: 120, height: 180),
+        sizeLabel: "4x6",
+        cwebpPath: "",
+        cpuLimit: 0,
+        render: { _, canvas in makeSolidImage(width: Int(canvas.width), height: Int(canvas.height), r: 1, g: 1, b: 1, a: 1) },
+        noExport: ["0.png", "2.png"]
+    )
+    var summary = ExportSummary()
+    var done = false
+    job.run(resolutions: [:]) { s in summary = s; done = true }
+    let deadline = Date().addingTimeInterval(30)
+    while !done && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    check(summary.jpgWritten == 3, "ExportJob exports 3 of 5 when 2 are flagged (got \(summary.jpgWritten))")
+    check(summary.skipped == 2, "ExportJob reports 2 skipped (got \(summary.skipped))")
+}
+
+// 3. Interactive preview benchmark: 3600x3000 canvas, 1000px preview, cached
+//    static layers; 50 transform-change frames; median <= 16 ms.
+do {
+    var layerSettings = LayerSettings.defaults
+    layerSettings.bg6 = .colour(RGBAColor(red: 1, green: 1, blue: 1))
+    layerSettings.gradient.enabled = false
+    let project = ProjectModel(
+        workingFolder: "/tmp/prints",
+        files: ["photo.jpg"],
+        currentIndex: 0,
+        selectedSize: .in12x10,
+        edits: EditStore(),
+        layerSettings: layerSettings
+    )
+    let photo = makeSolidImage(width: 2000, height: 1500, r: 0.2, g: 0.4, b: 0.8, a: 1)!
+    let preview = CGSize(width: 1000, height: 833)
+    let renderer = InteractivePreviewRenderer()
+    renderer.prepare(project: project, imageIndex: 0, canvasPixelSize: preview)
+
+    var samples: [Double] = []
+    for i in 0..<50 {
+        let edit = ImageEdit(scale: 1 + Double(i % 7) * 0.1,
+                             offsetX: Double(i % 5) * 7 - 14,
+                             offsetY: Double(i % 3) * 11 - 11,
+                             rotationDeg: Double(i % 9) * 2 - 8)
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let frame = renderer.renderFrame(edit: edit, photo: photo)
+        let t1 = DispatchTime.now().uptimeNanoseconds
+        if frame == nil { check(false, "interactive frame produced an image") }
+        samples.append(Double(t1 - t0) / 1_000_000.0)
+    }
+    let sorted = samples.sorted()
+    let median = sorted[sorted.count / 2]
+    print("interactive preview median = \(String(format: "%.3f", median)) ms")
+    check(median <= 16.0, "interactive preview median <= 16 ms (got \(String(format: "%.3f", median)) ms)")
+}
+
+// 4. NO EXPORT visuals never affect rendered output (Compositor ignores the flag).
+do {
+    var ls = LayerSettings.defaults
+    ls.bg6 = .colour(RGBAColor(red: 1, green: 0, blue: 0))
+    ls.gradient.enabled = false
+    var base = ProjectModel(workingFolder: "/tmp/prints", files: ["photo.jpg"],
+                            selectedSize: .in4x6, layerSettings: ls)
+    let compositor = Compositor()
+    let photo = makeSolidImage(width: 200, height: 200, r: 0, g: 1, b: 0, a: 1)!
+    let canvas = CGSize(width: 120, height: 180)
+    let a = compositor.render(project: base, imageIndex: 0, canvasPixelSize: canvas, photoSource: { _ in photo })
+    base.noExport = ["photo.jpg"]
+    let b = compositor.render(project: base, imageIndex: 0, canvasPixelSize: canvas, photoSource: { _ in photo })
+    var identical = a != nil && b != nil
+    if identical {
+        for p in [(x: 60, y: 90), (x: 10, y: 10), (x: 110, y: 170)] {
+            let pa = samplePixel(a!, x: p.x, y: p.y)
+            let pb = samplePixel(b!, x: p.x, y: p.y)
+            if !(isNear(pa.r, pb.r) && isNear(pa.g, pb.g) && isNear(pa.b, pb.b)) { identical = false }
+        }
+    }
+    check(identical, "Compositor output identical with noExport flag on/off")
+}
+
 if failures == 0 {
     print("PrintProcessorCheck: PASS")
     exit(0)

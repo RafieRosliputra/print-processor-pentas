@@ -382,6 +382,8 @@ public final class ExportJob {
     private let cwebpPath: String
     private let cpuLimit: Int
     private let render: (Int, CGSize) -> CGImage?
+    /// Basenames of photos flagged "NO EXPORT" — these are skipped entirely.
+    private let noExport: Set<String>
 
     private let stateLock = NSLock()
     private var cancelledFlag = false
@@ -395,7 +397,8 @@ public final class ExportJob {
         sizeLabel: String,
         cwebpPath: String,
         cpuLimit: Int,
-        render: @escaping (Int, CGSize) -> CGImage?
+        render: @escaping (Int, CGSize) -> CGImage?,
+        noExport: Set<String> = []
     ) {
         self.files = files
         self.formats = formats
@@ -406,6 +409,7 @@ public final class ExportJob {
         self.cwebpPath = cwebpPath
         self.cpuLimit = cpuLimit
         self.render = render
+        self.noExport = noExport
     }
 
     public func cancel() {
@@ -418,6 +422,11 @@ public final class ExportJob {
         stateLock.lock()
         defer { stateLock.unlock() }
         return cancelledFlag
+    }
+
+    /// Whether a source photo is flagged "NO EXPORT".
+    private func isSkipped(_ url: URL) -> Bool {
+        noExport.contains(url.lastPathComponent)
     }
 
     // MARK: - Paths
@@ -433,9 +442,11 @@ public final class ExportJob {
         return exportRoot.appendingPathComponent(format.folderName).appendingPathComponent(name)
     }
 
-    /// Compute every planned output and whether it already exists.
+    /// Compute every planned output and whether it already exists. Photos flagged
+    /// "NO EXPORT" produce no items (they are skipped before collision handling).
     public func plan() -> [ExportItem] {
-        files.enumerated().map { index, url in
+        files.enumerated().compactMap { index, url in
+            guard !isSkipped(url) else { return nil }
             let name = url.lastPathComponent
             let jpgURL = formats.contains(.jpg) ? destinationURL(sourceName: name, index: index, format: .jpg) : nil
             let webpURL = formats.contains(.webp) ? destinationURL(sourceName: name, index: index, format: .webp) : nil
@@ -503,6 +514,9 @@ public final class ExportJob {
         let progress = ProgressBox()
         let group = DispatchGroup()
 
+        // Photos flagged "NO EXPORT" are skipped before any work is planned.
+        let skippedCount = files.filter { isSkipped($0) }.count
+
         var jpgTotal = 0
         var webpTotal = 0
         for unit in units {
@@ -557,6 +571,7 @@ public final class ExportJob {
             self?.isRunning = false
             var result = summary.snapshot
             result.total = totalUnits
+            result.skipped = skippedCount
             completion(result)
         }
     }

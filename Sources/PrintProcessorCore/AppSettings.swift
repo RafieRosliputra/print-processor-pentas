@@ -56,7 +56,7 @@ public struct AppSettings: Codable, Equatable {
         nudgeBasis: .export,
         tooltipDelay: 0.5,
         scanMode: "text=right",
-        savedScanModes: ["text=right", "text=left,watermark=right"],
+        savedScanModes: ["text=right", "text=left,watermark=right", "text=none,watermark=left"],
         psdTextLayerName: "TEXT",
         minTextScale: 0.4,
         photoshopPath: "",
@@ -75,7 +75,7 @@ public struct AppSettings: Codable, Equatable {
         nudgeBasis: NudgeBasis,
         tooltipDelay: Double,
         scanMode: String = "text=right",
-        savedScanModes: [String] = ["text=right", "text=left,watermark=right"],
+        savedScanModes: [String] = ["text=right", "text=left,watermark=right", "text=none,watermark=left"],
         psdTextLayerName: String = "TEXT",
         minTextScale: Double = 0.4,
         photoshopPath: String = "",
@@ -121,7 +121,9 @@ public struct AppSettings: Codable, Equatable {
         nudgeBasis = try c.decodeIfPresent(NudgeBasis.self, forKey: .nudgeBasis) ?? .export
         tooltipDelay = try c.decodeIfPresent(Double.self, forKey: .tooltipDelay) ?? 0.5
         scanMode = try c.decodeIfPresent(String.self, forKey: .scanMode) ?? "text=right"
-        savedScanModes = try c.decodeIfPresent([String].self, forKey: .savedScanModes) ?? ["text=right", "text=left,watermark=right"]
+        savedScanModes = try c.decodeIfPresent([String].self, forKey: .savedScanModes) ?? ["text=right", "text=left,watermark=right", "text=none,watermark=left"]
+        // Migration: older settings files lack the "watermark = whole file name" preset.
+        if !savedScanModes.contains("text=none,watermark=left") { savedScanModes.append("text=none,watermark=left") }
         psdTextLayerName = try c.decodeIfPresent(String.self, forKey: .psdTextLayerName) ?? "TEXT"
         minTextScale = try c.decodeIfPresent(Double.self, forKey: .minTextScale) ?? 0.4
         photoshopPath = try c.decodeIfPresent(String.self, forKey: .photoshopPath) ?? ""

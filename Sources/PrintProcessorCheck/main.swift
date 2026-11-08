@@ -1291,3 +1291,8 @@ if failures == 0 {
     print("PrintProcessorCheck: \(failures) FAILURE(S)")
     exit(1)
 }
+
+do {
+    let r = TextSourceResolver.resolve(fileName: "123.webp", manualText: "", list: [:], scanMode: ScanMode.parse("text=none,watermark=left"))
+    check(r.watermark == "123" && r.text.isEmpty, "single-name file 123.webp -> watermark 123 with text=none,watermark=left")
+}

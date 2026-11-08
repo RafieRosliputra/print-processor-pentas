@@ -156,4 +156,10 @@ final class SectionView: NSView {
         isVisible = visible
         updateEyeIcon()
     }
+
+    /// Whether the window's first responder is this section or one of its controls.
+    func containsFirstResponder() -> Bool {
+        guard let responder = window?.firstResponder as? NSView else { return false }
+        return responder === self || responder.isDescendant(of: self)
+    }
 }

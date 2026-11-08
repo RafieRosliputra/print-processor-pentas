@@ -216,7 +216,7 @@ final class SettingsView: NSView {
             autosaveSeconds: autosaveSeconds,
             export: export,
             cpuLimit: cpuLimit
-        )
+        ).clamped()
     }
 
     func reload() {

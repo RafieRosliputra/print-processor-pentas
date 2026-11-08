@@ -72,3 +72,8 @@ and are read live by the canvas.
 - UI language is English; brand is written `JohorStudio.com`.
 - Requires Command Line Tools only; no `.metal` shaders are used.
 - Photoshop is auto-detected in `/Applications` (path override in Settings).
+- Tooltip delay: tooltips are set via `NSView.toolTip` (system default delay).
+  The Settings → "Tooltip delay (s)" value is stored and clamped, but AppKit
+  exposes no public API to change the global tooltip delay, and
+  `NSToolTipManager` is not in the public SDK interface, so the value is not
+  currently applied at runtime (documented limitation).

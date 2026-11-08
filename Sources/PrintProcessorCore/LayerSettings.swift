@@ -76,20 +76,47 @@ public struct WatermarkTransform: Codable, Equatable {
     public var offsetFractionX: Double
     /// Distance from the bottom edge, as a fraction of canvas height.
     public var offsetFractionY: Double
-    /// Additional size multiplier (1 = the `sizeFraction` text size).
-    public var scale: Double
+    /// Horizontal size multiplier (1 = the `sizeFraction` text size).
+    public var scaleX: Double
+    /// Vertical size multiplier (1 = the `sizeFraction` text size).
+    public var scaleY: Double
     /// Clockwise rotation in degrees about the text's bottom-right anchor.
     public var rotationDeg: Double
 
     public init(offsetFractionX: Double = 0.05, offsetFractionY: Double = 0.05,
-                scale: Double = 1, rotationDeg: Double = 0) {
+                scaleX: Double = 1, scaleY: Double = 1, rotationDeg: Double = 0) {
         self.offsetFractionX = offsetFractionX
         self.offsetFractionY = offsetFractionY
-        self.scale = scale
+        self.scaleX = scaleX
+        self.scaleY = scaleY
         self.rotationDeg = rotationDeg
     }
 
     public static let identity = WatermarkTransform()
+
+    // Backward-compatible Codable: older projects stored a single `scale`.
+    private enum CodingKeys: String, CodingKey {
+        case offsetFractionX, offsetFractionY, scaleX, scaleY, rotationDeg, scale
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        offsetFractionX = try c.decodeIfPresent(Double.self, forKey: .offsetFractionX) ?? 0.05
+        offsetFractionY = try c.decodeIfPresent(Double.self, forKey: .offsetFractionY) ?? 0.05
+        let legacy = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1
+        scaleX = try c.decodeIfPresent(Double.self, forKey: .scaleX) ?? legacy
+        scaleY = try c.decodeIfPresent(Double.self, forKey: .scaleY) ?? legacy
+        rotationDeg = try c.decodeIfPresent(Double.self, forKey: .rotationDeg) ?? 0
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(offsetFractionX, forKey: .offsetFractionX)
+        try c.encode(offsetFractionY, forKey: .offsetFractionY)
+        try c.encode(scaleX, forKey: .scaleX)
+        try c.encode(scaleY, forKey: .scaleY)
+        try c.encode(rotationDeg, forKey: .rotationDeg)
+    }
 }
 
 /// Watermark (layer 1) settings.
@@ -128,17 +155,43 @@ public struct WatermarkSettings: Codable, Equatable {
 public struct OverlayTransform: Codable, Equatable {
     public var offsetX: Double
     public var offsetY: Double
-    public var scale: Double
+    public var scaleX: Double
+    public var scaleY: Double
     public var rotationDeg: Double
 
-    public init(offsetX: Double = 0, offsetY: Double = 0, scale: Double = 1, rotationDeg: Double = 0) {
+    public init(offsetX: Double = 0, offsetY: Double = 0, scaleX: Double = 1, scaleY: Double = 1, rotationDeg: Double = 0) {
         self.offsetX = offsetX
         self.offsetY = offsetY
-        self.scale = scale
+        self.scaleX = scaleX
+        self.scaleY = scaleY
         self.rotationDeg = rotationDeg
     }
 
     public static let identity = OverlayTransform()
+
+    // Backward-compatible Codable: older projects stored a single `scale`.
+    private enum CodingKeys: String, CodingKey {
+        case offsetX, offsetY, scaleX, scaleY, rotationDeg, scale
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        offsetX = try c.decodeIfPresent(Double.self, forKey: .offsetX) ?? 0
+        offsetY = try c.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
+        let legacy = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1
+        scaleX = try c.decodeIfPresent(Double.self, forKey: .scaleX) ?? legacy
+        scaleY = try c.decodeIfPresent(Double.self, forKey: .scaleY) ?? legacy
+        rotationDeg = try c.decodeIfPresent(Double.self, forKey: .rotationDeg) ?? 0
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(offsetX, forKey: .offsetX)
+        try c.encode(offsetY, forKey: .offsetY)
+        try c.encode(scaleX, forKey: .scaleX)
+        try c.encode(scaleY, forKey: .scaleY)
+        try c.encode(rotationDeg, forKey: .rotationDeg)
+    }
 }
 
 /// Overlay (layer 3) settings. The overlay image (PNG/WebP with alpha) is

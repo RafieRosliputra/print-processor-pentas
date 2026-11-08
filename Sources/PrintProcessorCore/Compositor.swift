@@ -56,13 +56,14 @@ public enum LayerGeometry {
         canvas: CGSize,
         offsetX: Double,
         offsetY: Double,
-        scale: Double,
+        scaleX: Double,
+        scaleY: Double,
         rotationDeg: Double
     ) -> CGAffineTransform {
         var t = CGAffineTransform(translationX: canvas.width / 2, y: canvas.height / 2)
         t = t.concatenating(CGAffineTransform(translationX: CGFloat(offsetX), y: CGFloat(offsetY)))
         t = t.concatenating(CGAffineTransform(rotationAngle: CGFloat(rotationDeg * .pi / 180)))
-        t = t.concatenating(CGAffineTransform(scaleX: CGFloat(scale), y: CGFloat(scale)))
+        t = t.concatenating(CGAffineTransform(scaleX: CGFloat(scaleX), y: CGFloat(scaleY)))
         return t
     }
 
@@ -86,7 +87,7 @@ public enum LayerGeometry {
         let fit = fittedRect(canvas: canvas, imageSize: imageSize)
         let local = CGRect(x: -fit.width / 2, y: -fit.height / 2, width: fit.width, height: fit.height)
         let t = centeredTransform(canvas: canvas, offsetX: edit.offsetX, offsetY: edit.offsetY,
-                                  scale: edit.scale, rotationDeg: edit.rotationDeg)
+                                  scaleX: edit.scale, scaleY: edit.scale, rotationDeg: edit.rotationDeg)
         return boundingBox(of: local, transform: t)
     }
 
@@ -97,7 +98,8 @@ public enum LayerGeometry {
         let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
         let t = centeredTransform(canvas: canvas, offsetX: overlay.transform.offsetX,
                                   offsetY: overlay.transform.offsetY,
-                                  scale: overlay.transform.scale,
+                                  scaleX: overlay.transform.scaleX,
+                                  scaleY: overlay.transform.scaleY,
                                   rotationDeg: overlay.transform.rotationDeg)
         return boundingBox(of: local, transform: t)
     }
@@ -123,7 +125,7 @@ public enum LayerGeometry {
     /// Bounding rect of layer 1 (watermark text) under its transform.
     public static func watermarkRect(canvas: CGSize, watermark: WatermarkSettings) -> CGRect {
         guard !watermark.text.isEmpty else { return .zero }
-        let fontSize = CGFloat(watermark.sizeFraction * Double(canvas.width) * watermark.transform.scale)
+        let fontSize = CGFloat(watermark.sizeFraction * Double(canvas.width))
         guard fontSize > 0 else { return .zero }
         let font = Compositor.resolveFont(name: watermark.fontName, size: fontSize)
         let attributed = NSAttributedString(string: watermark.text, attributes: [
@@ -133,8 +135,8 @@ public enum LayerGeometry {
         var ascent: CGFloat = 0
         var descent: CGFloat = 0
         var leading: CGFloat = 0
-        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
-        let height = ascent + descent
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading)) * CGFloat(watermark.transform.scaleX)
+        let height = (ascent + descent) * CGFloat(watermark.transform.scaleY)
 
         let ax = CGFloat(Double(canvas.width) * (1 - watermark.transform.offsetFractionX))
         let ay = CGFloat(Double(canvas.height) * watermark.transform.offsetFractionY)
@@ -158,9 +160,6 @@ public enum LayerGeometry {
 public final class Compositor {
     private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
-    /// Path → decoded image cache (overlay / bg5 / bg6 image), keyed by path.
-    private var imageCache: [String: CGImage] = [:]
-
     /// Layer-2 styled text image (trimmed), set by the controller after a
     /// background Photoshop render. Drawn fitted into `layer2Box`.
     public var layer2Image: CGImage?
@@ -175,7 +174,7 @@ public final class Compositor {
 
     /// Drop cached decoded images (e.g. after loading a new overlay file).
     public func invalidateCache() {
-        imageCache.removeAll()
+        DecodedImageCache.shared.invalidateAll()
     }
 
     /// Render one image of a project at `canvasPixelSize`.
@@ -301,11 +300,7 @@ public final class Compositor {
 
     private func image(atPath path: String) -> CGImage? {
         guard !path.isEmpty else { return nil }
-        if let cached = imageCache[path] { return cached }
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        imageCache[path] = image
-        return image
+        return DecodedImageCache.shared.decode(path)
     }
 
     // MARK: - Layer drawing
@@ -370,14 +365,14 @@ public final class Compositor {
         ctx.translateBy(x: canvas.width / 2, y: canvas.height / 2)
         ctx.translateBy(x: CGFloat(overlay.transform.offsetX * offsetScale), y: CGFloat(overlay.transform.offsetY * offsetScale))
         ctx.rotate(by: CGFloat(overlay.transform.rotationDeg * .pi / 180))
-        ctx.scaleBy(x: CGFloat(overlay.transform.scale), y: CGFloat(overlay.transform.scale))
+        ctx.scaleBy(x: CGFloat(overlay.transform.scaleX), y: CGFloat(overlay.transform.scaleY))
         ctx.draw(image, in: local)
         ctx.restoreGState()
     }
 
     private func drawWatermark(_ ctx: CGContext, _ watermark: WatermarkSettings, canvas: CGSize) {
         guard !watermark.text.isEmpty else { return }
-        let fontSize = CGFloat(watermark.sizeFraction * Double(canvas.width) * watermark.transform.scale)
+        let fontSize = CGFloat(watermark.sizeFraction * Double(canvas.width))
         guard fontSize > 0 else { return }
 
         let font = Self.resolveFont(name: watermark.fontName, size: fontSize)
@@ -398,6 +393,7 @@ public final class Compositor {
         ctx.setAlpha(CGFloat(watermark.opacity))
         ctx.translateBy(x: ax, y: ay)
         ctx.rotate(by: CGFloat(watermark.transform.rotationDeg * .pi / 180))
+        ctx.scaleBy(x: CGFloat(watermark.transform.scaleX), y: CGFloat(watermark.transform.scaleY))
         ctx.textPosition = CGPoint(x: -width, y: descent)
         CTLineDraw(line, ctx)
         ctx.restoreGState()

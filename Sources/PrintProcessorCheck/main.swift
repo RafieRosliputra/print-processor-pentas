@@ -169,7 +169,8 @@ ls.enabled.layer3 = false
 ls.watermark.text = "01"
 ls.watermark.transform.rotationDeg = 12.5
 ls.overlay.path = "/tmp/overlay.webp"
-ls.overlay.transform.scale = 0.7
+ls.overlay.transform.scaleX = 0.7
+ls.overlay.transform.scaleY = 0.9
 ls.gradient.angle = 45
 ls.gradient.blend = .overlay
 ls.bg5.path = "/tmp/bg5.png"
@@ -196,7 +197,7 @@ do {
         path: bluePath,
         fit: true,
         transform: OverlayTransform(offsetX: 100 - 600, offsetY: 1700 - 900,
-                                    scale: 200.0 / 1200.0, rotationDeg: 0)
+                                    scaleX: 200.0 / 1200.0, scaleY: 200.0 / 1200.0, rotationDeg: 0)
     )
 
     var layerSettings = LayerSettings.defaults
@@ -644,6 +645,194 @@ if WebPEncoder.isAvailable {
     }
 } else {
     print("[skip] cwebp not found — WebP export check skipped")
+}
+
+// MARK: - Polish additions (symlink guard, clamp, shrink, PSD paths, concurrent cache)
+
+// 2. Symlink directory loop import terminates (resolved-path guard).
+do {
+    let tmp = makeTempDir("symlink")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let sub = URL(fileURLWithPath: tmp).appendingPathComponent("sub")
+    try? FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+    // A symlink inside sub pointing back to its ancestor creates a cycle.
+    let loop = sub.appendingPathComponent("loop")
+    try? FileManager.default.createSymbolicLink(at: loop, withDestinationURL: URL(fileURLWithPath: tmp))
+    makeFile(sub.appendingPathComponent("a.jpg").path, [1])
+    let collected = DirectoryScan.collectFiles(from: [URL(fileURLWithPath: tmp)]) {
+        $0.pathExtension.lowercased() == "jpg"
+    }
+    check(collected.count == 1, "DirectoryScan terminates on symlink loop (found \(collected.count))")
+}
+
+// 3. AppSettings numeric fields clamp to bounds.
+do {
+    var s = AppSettings.defaults
+    s.rotateStep = 99
+    s.scrollZoomSpeed = -5
+    s.scrollRotateSpeed = 0
+    s.doubleTapMs = 5
+    let c = s.clamped()
+    check(c.rotateStep == 1.5, "clamp rotateStep to 1.5 (got \(c.rotateStep))")
+    check(c.scrollZoomSpeed > 0, "clamp scrollZoomSpeed > 0 (got \(c.scrollZoomSpeed))")
+    check(c.scrollRotateSpeed > 0, "clamp scrollRotateSpeed > 0 (got \(c.scrollRotateSpeed))")
+    check(c.doubleTapMs == 100, "clamp doubleTapMs to 100 (got \(c.doubleTapMs))")
+}
+
+// 4. Layer-2 text wider than the box shrinks to fit, never below minTextScale.
+do {
+    final class WideRunner: PhotoshopRunnerProtocol {
+        let width: Int
+        init(width: Int) { self.width = width }
+        func renderPNG(psdPath: String, text: String?, layerName: String, outputPNG: String) -> Bool {
+            guard let img = makeSolidImage(width: width, height: 40, r: 1, g: 1, b: 1, a: 1) else { return false }
+            return writePNG(img, to: URL(fileURLWithPath: outputPNG))
+        }
+    }
+    let tmp = makeTempDir("shrink")
+    let psdPath = tmp + "/template.psd"
+    makeFile(psdPath, [0x38, 0x42, 0x50, 0x53])
+    let renderer = PSDTextLayerRenderer(runner: WideRunner(width: 1000), cacheDirectory: tmp,
+                                        layerName: "TEXT", minTextScale: 0.5)
+    let image = renderer.render(psdPath: psdPath, text: "Norman", boxSize: CGSize(width: 400, height: 100))
+    check(image?.width == 500, "layer-2 text shrinks to minTextScale bound (got \(image?.width ?? 0), expected 500)")
+    check(PSDTextLayerRenderer.shrinkScale(imageWidth: 1000, boxWidth: 400, minScale: 0.5) == 0.5,
+          "shrinkScale clamps to min 0.5")
+    check(PSDTextLayerRenderer.shrinkScale(imageWidth: 100, boxWidth: 400, minScale: 0.5) == 1,
+          "shrinkScale leaves fitting text unchanged")
+    // Short boxes constrain the shrink too (height-aware), never below minScale.
+    check(PSDTextLayerRenderer.shrinkScale(imageSize: CGSize(width: 100, height: 1000),
+                                           boxSize: CGSize(width: 200, height: 400), minScale: 0.5) == 0.5,
+          "shrinkScale is height-aware and clamps to min 0.5")
+    check(PSDTextLayerRenderer.shrinkScale(imageSize: CGSize(width: 100, height: 200),
+                                           boxSize: CGSize(width: 200, height: 400), minScale: 0.5) == 1,
+          "shrinkScale leaves fitting (width+height) text unchanged")
+    let wrapped = PSDTextFit.wrap("aaaa bbbb cccc dddd", maxLines: 2,
+                                  maxWidth: PSDTextFit.measureWidth("aaaa bbbb"))
+    check(wrapped.contains("\n"), "PSDTextFit.wrap is width-aware (got \(wrapped.replacingOccurrences(of: "\n", with: "|")))")
+}
+
+// 5. Layer-2 + layer-3 PSD paths survive a project JSON round-trip.
+do {
+    var model = ProjectModel(workingFolder: "/tmp/prints", files: ["a.jpg"], selectedSize: .in4x6)
+    model.layerSettings.psdText.path = "/tmp/text.psd"
+    model.overlayPSDPath = "/tmp/overlay.psd"
+    model.overlayCounter = 7
+    if let data = try? JSONEncoder().encode(model),
+       let decoded = try? JSONDecoder().decode(ProjectModel.self, from: data) {
+        check(decoded == model, "ProjectModel round-trips layer-2/3 PSD paths")
+        check(decoded.layerSettings.psdText.path == "/tmp/text.psd", "layer-2 PSD path persisted")
+        check(decoded.overlayPSDPath == "/tmp/overlay.psd", "layer-3 overlay PSD path persisted")
+    } else {
+        check(false, "ProjectModel PSD-path round-trip decode")
+    }
+}
+
+// 7. Concurrent decode of one URL keeps ImageCache byte count consistent.
+do {
+    let tmp = makeTempDir("concurrent")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let url = URL(fileURLWithPath: writeTempPNG(makeSolidImage(width: 200, height: 200, r: 1, g: 0, b: 0, a: 1)!, name: "conc.png"))
+    defer { try? FileManager.default.removeItem(at: url) }
+    let cache = ImageCache(ramCapBytes: 10_000_000)
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var firstImage: CGImage?
+    for _ in 0..<8 {
+        group.enter()
+        DispatchQueue.global().async {
+            let img = cache.preview(url: url)
+            lock.lock()
+            if firstImage == nil { firstImage = img }
+            lock.unlock()
+            group.leave()
+        }
+    }
+    _ = group.wait(timeout: .now() + 10)
+    if let img = firstImage {
+        let expected = img.bytesPerRow * img.height
+        check(cache.ramUsageBytes() == expected,
+              "ImageCache byte count consistent under concurrent decode (got \(cache.ramUsageBytes()), expected \(expected))")
+    } else {
+        check(false, "ImageCache concurrent decode produced an image")
+    }
+}
+
+// 8. Undo history is per image and cleared when switching images (SPEC §2).
+do {
+    var history = ImageUndoHistory()
+    history.push(fileName: "a.jpg", value: ImageEdit(offsetX: 1))
+    history.push(fileName: "a.jpg", value: ImageEdit(offsetX: 2))
+    history.push(fileName: "b.jpg", value: ImageEdit(offsetX: 3))
+    check(history.depth(fileName: "a.jpg") == 2 && history.depth(fileName: "b.jpg") == 1,
+          "ImageUndoHistory retains per-image steps")
+    // Undo one step on the current image still works.
+    let undone = history.undo(fileName: "a.jpg", current: ImageEdit(offsetX: 9))
+    check(undone?.offsetX == 2, "ImageUndoHistory undo returns previous step (got \(undone?.offsetX ?? -1))")
+    // Switching images clears all history.
+    history.clear()
+    check(history.isEmpty && history.depth(fileName: "a.jpg") == 0 && history.depth(fileName: "b.jpg") == 0,
+          "ImageUndoHistory cleared when switching images")
+}
+
+// 9. Cancel path restores the original bytes unchanged (fake watcher flow).
+do {
+    let tmp = makeTempDir("cancel")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let original = URL(fileURLWithPath: tmp).appendingPathComponent("photo.jpg")
+    let backup = URL(fileURLWithPath: tmp).appendingPathComponent("pp-orig-photo.jpg")
+    let originalBytes: [UInt8] = Array("ORIGINAL".utf8)
+    let editedBytes: [UInt8] = Array("EDITED-EDITED".utf8)
+    makeFile(original.path, originalBytes)
+    // Simulate the pre-edit backup + Photoshop modifying the original in place.
+    try? FileManager.default.copyItem(at: original, to: backup)
+    makeFile(original.path, editedBytes)
+
+    let restored = PhotoEditSave.cancel(original: original, backup: backup, hadBackup: true)
+    let after = try? Data(contentsOf: original)
+    check(restored, "PhotoEditSave.cancel reports a restore")
+    check(after?.elementsEqual(originalBytes) == true,
+          "Cancel path leaves original bytes unchanged")
+    check(!FileManager.default.fileExists(atPath: backup.path),
+          "Cancel path removes the temporary backup")
+}
+
+// 10. Save-as-new-version re-encodes (never a raw byte copy under .webp).
+do {
+    let tmp = makeTempDir("savenew")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    let original = URL(fileURLWithPath: tmp).appendingPathComponent("photo.jpg")
+    let backup = URL(fileURLWithPath: tmp).appendingPathComponent("pp-orig-photo.jpg")
+    // Both the untouched original and the edited copy are valid decodable images.
+    _ = writePNG(makeSolidImage(width: 40, height: 40, r: 1, g: 0, b: 0, a: 1)!, to: original)
+    let originalBytes = try? Data(contentsOf: original)
+    try? FileManager.default.copyItem(at: original, to: backup)
+    _ = writePNG(makeSolidImage(width: 30, height: 30, r: 0, g: 1, b: 0, a: 1)!, to: original)
+    let editedBytes = try? Data(contentsOf: original)
+
+    // The encoder must be the one writing the output (re-encoded), not a copy.
+    // Re-encode to a different size so the output provably differs from the
+    // edited file's raw bytes (mirrors real WebP re-encoding).
+    var encodedCalled = false
+    let wrote = PhotoEditSave.saveAsNewVersion(original: original, backup: backup, hadBackup: true,
+                                               number: 0) { _, url in
+        encodedCalled = true
+        return writePNG(makeSolidImage(width: 99, height: 99, r: 0, g: 0, b: 1, a: 1)!, to: url)
+    }
+    let out = WebPNumbering.outputURL(psdURL: original, number: 0)
+    check(wrote && encodedCalled, "Save-as-new-version re-encodes the edited copy")
+    check(FileManager.default.fileExists(atPath: out.path),
+          "Save-as-new-version writes the numbered file")
+    // The output is a re-encoded image, not a raw copy of the edited bytes.
+    if let data = try? Data(contentsOf: out), let edited = editedBytes {
+        check(data != edited, "Save-as-new-version does not raw-copy edited bytes")
+    } else {
+        check(false, "Save-as-new-version output readable")
+    }
+    // The original photo is restored untouched.
+    let after = try? Data(contentsOf: original)
+    check(after == originalBytes,
+          "Save-as-new-version restores the original photo untouched")
 }
 
 if failures == 0 {

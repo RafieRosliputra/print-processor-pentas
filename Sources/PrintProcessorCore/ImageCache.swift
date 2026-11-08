@@ -84,6 +84,11 @@ public final class ImageCache {
     private func store(_ key: String, image: CGImage) {
         lock.lock(); defer { lock.unlock() }
         let size = image.bytesPerRow * image.height
+        // Two threads decoding the same URL can store the same key twice; remove
+        // the previous size first so currentBytes is never double-counted.
+        if let previous = byteSizes[key] {
+            currentBytes -= previous
+        }
         entries[key] = image
         byteSizes[key] = size
         currentBytes += size

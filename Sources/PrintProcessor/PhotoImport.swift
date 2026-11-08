@@ -16,38 +16,10 @@ enum PhotoImport {
 
     /// Expand a mix of files and folders into a flat, de-duplicated, natural-sorted
     /// list of supported photo file URLs. Folders are scanned recursively and
-    /// hidden files/folders are skipped.
+    /// hidden files/folders are skipped. Symlinked directory loops are guarded by
+    /// a visited set of resolved (symlink-free) paths.
     static func collectFiles(from urls: [URL]) -> [URL] {
-        var result: [URL] = []
-        var seen = Set<String>()
-        for url in urls {
-            collect(from: url, into: &result, seen: &seen)
-        }
-        return naturalSorted(result)
-    }
-
-    /// Depth-first, recursive collection of supported photos under `url`.
-    private static func collect(from url: URL, into result: inout [URL], seen: inout Set<String>) {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
-        if isDir.boolValue {
-            let children = (try? FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles])) ?? []
-            for child in children {
-                collect(from: child, into: &result, seen: &seen)
-            }
-        } else if isSupported(url) {
-            add(url, to: &result, seen: &seen)
-        }
-    }
-
-    private static func add(_ url: URL, to result: inout [URL], seen: inout Set<String>) {
-        let key = url.standardizedFileURL.path
-        if seen.insert(key).inserted {
-            result.append(url)
-        }
+        naturalSorted(DirectoryScan.collectFiles(from: urls, isIncluded: isSupported))
     }
 
     /// Sort file URLs by natural filename order.

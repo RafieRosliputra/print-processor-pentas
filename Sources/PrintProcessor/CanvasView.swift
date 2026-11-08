@@ -89,8 +89,9 @@ final class CanvasView: NSView {
     var onWatermarkChanged: ((WatermarkTransform, Bool, Bool) -> Void)?
     /// Layer-3 transform changed (same commit/option convention).
     var onOverlayChanged: ((OverlayTransform, Bool, Bool) -> Void)?
-    /// Layer-2 bounding box changed. `commit` = gesture finished.
-    var onPSDTextBoxChanged: ((PSDTextBox, Bool) -> Void)?
+    /// Layer-2 bounding box changed. `commit` = gesture finished; `option` =
+    /// Option was held (write a per-image override).
+    var onPSDTextBoxChanged: ((PSDTextBox, Bool, Bool) -> Void)?
     /// Middle-click (button 2) hit a layer element: 2 / 3 / 4.
     var onMiddleClick: ((Int) -> Void)?
 
@@ -114,6 +115,7 @@ final class CanvasView: NSView {
     private var lastDragPoint: NSPoint?
     private var spacePending: DispatchWorkItem?
     private var commitWorkItem: DispatchWorkItem?
+    private var lastCommittedEdit: ImageEdit?
     private var preciseRotateAccum: Double = 0
     private var gestureActive = false
     private var gestureEndWorkItem: DispatchWorkItem?
@@ -125,6 +127,9 @@ final class CanvasView: NSView {
     private var transformGestureMode: TransformMode = .move
     private var transformGestureStart: CGPoint = .zero      // canvas coordinates
     private var transformGestureOption = false
+    private var transformGestureShift = false
+    private var transformGestureScaleHandle: Int? = nil
+    private var transformGestureAnchor: CGPoint = .zero
     private var transformGestureStartWatermark = WatermarkTransform.identity
     private var transformGestureStartOverlay = OverlayTransform.identity
     private var transformGestureStartPSDBox = PSDTextBox.defaults
@@ -266,7 +271,8 @@ final class CanvasView: NSView {
             canvas: compositePixelSize,
             offsetX: overlayTransform.offsetX * s,
             offsetY: overlayTransform.offsetY * s,
-            scale: overlayTransform.scale,
+            scaleX: overlayTransform.scaleX,
+            scaleY: overlayTransform.scaleY,
             rotationDeg: overlayTransform.rotationDeg
         )
         return LayerGeometry.boundingBox(of: local, transform: t)
@@ -274,8 +280,9 @@ final class CanvasView: NSView {
 
     private func watermarkBox() -> CGRect {
         guard let base = watermarkBaseSize, base.width > 0, base.height > 0 else { return .zero }
-        let s = watermarkTransform.scale
-        let local = CGRect(x: -base.width * s, y: 0, width: base.width * s, height: base.height * s)
+        let sx = watermarkTransform.scaleX
+        let sy = watermarkTransform.scaleY
+        let local = CGRect(x: -base.width * sx, y: 0, width: base.width * sx, height: base.height * sy)
         let ax = CGFloat(Double(compositePixelSize.width) * (1 - watermarkTransform.offsetFractionX))
         let ay = CGFloat(Double(compositePixelSize.height) * watermarkTransform.offsetFractionY)
         let t = CGAffineTransform(translationX: ax, y: ay)
@@ -515,17 +522,18 @@ final class CanvasView: NSView {
 
         // 1. Handle an existing selection (rotate / scale / move / deselect).
         if let sel = selection {
+            let shift = event.modifierFlags.contains(.shift)
             if sel != .psdText,
                hitRotateHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
-                beginTransform(sel, mode: .rotate, start: canvas, option: event.modifierFlags.contains(.option))
+                beginTransform(sel, mode: .rotate, start: canvas, option: event.modifierFlags.contains(.option), shift: shift)
                 return
             }
-            if hitScaleHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) != nil {
-                beginTransform(sel, mode: .scale, start: canvas, option: event.modifierFlags.contains(.option))
+            if let handle = hitScaleHandle(screenPoint, box: selectionBox().toScreen(scale: screenScale(), paper: paperRect())) {
+                beginTransform(sel, mode: .scale, start: canvas, option: event.modifierFlags.contains(.option), shift: shift, scaleHandle: handle)
                 return
             }
             if selectionBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
-                beginTransform(sel, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
+                beginTransform(sel, mode: .move, start: canvas, option: event.modifierFlags.contains(.option), shift: shift)
                 return
             }
             // Click outside → deselect, then fall through to layer-4 pan.
@@ -536,7 +544,7 @@ final class CanvasView: NSView {
         if let psdBox = psdTextBox,
            psdBox.pixelRect(canvas: compositePixelSize).toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
             selection = .psdText
-            beginTransform(.psdText, mode: .move, start: canvas, option: false)
+            beginTransform(.psdText, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
         }
         if !overlayBox().isEmpty && overlayBox().toScreen(scale: screenScale(), paper: paperRect()).insetBy(dx: -4, dy: -4).contains(screenPoint) {
@@ -579,7 +587,7 @@ final class CanvasView: NSView {
                 height: Double((clampedTop - clampedBottom) / rect.height)
             ).clamped()
             psdTextBox = box
-            onPSDTextBoxChanged?(box, false)
+            onPSDTextBoxChanged?(box, false, false)
             return
         }
 
@@ -603,7 +611,7 @@ final class CanvasView: NSView {
         if psdBoxDrawStart != nil {
             psdBoxDrawStart = nil
             if let box = psdTextBox {
-                onPSDTextBoxChanged?(box, true)
+                onPSDTextBoxChanged?(box, true, false)
             }
             return
         }
@@ -625,20 +633,64 @@ final class CanvasView: NSView {
 
     // MARK: - Free-transform plumbing
 
-    private func beginTransform(_ layer: SelectedLayer, mode: TransformMode, start: CGPoint, option: Bool) {
+    private func beginTransform(_ layer: SelectedLayer, mode: TransformMode, start: CGPoint, option: Bool,
+                                shift: Bool = false, scaleHandle: Int? = nil) {
         transformGestureLayer = layer
         transformGestureMode = mode
         transformGestureStart = start
         transformGestureOption = option
+        transformGestureShift = shift
+        transformGestureScaleHandle = scaleHandle
         transformGestureStartWatermark = watermarkTransform
         transformGestureStartOverlay = overlayTransform
         transformGestureStartPSDBox = psdTextBox ?? .defaults
+        transformGestureAnchor = scaleAnchor(for: layer)
         beginGesture()
     }
 
     private func endTransform() {
         transformGestureLayer = nil
         transformGestureOption = false
+        transformGestureShift = false
+        transformGestureScaleHandle = nil
+    }
+
+    /// Whether the given scale handle is a corner or an edge midpoint.
+    private enum ScaleHandleKind { case corner, edgeX, edgeY }
+
+    private func scaleHandleKind(_ index: Int) -> ScaleHandleKind {
+        switch index {
+        case 0, 2, 5, 7: return .corner
+        case 1, 6: return .edgeX
+        default: return .edgeY
+        }
+    }
+
+    /// Fixed pivot for the current transform gesture, computed from the
+    /// transforms captured at drag start (never from the live, drifting box).
+    private func scaleAnchor(for layer: SelectedLayer) -> CGPoint {
+        switch layer {
+        case .overlay:
+            let base = overlayBaseSize ?? .zero
+            let s = canvasOffsetScale()
+            let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
+            let t = LayerGeometry.centeredTransform(
+                canvas: compositePixelSize,
+                offsetX: transformGestureStartOverlay.offsetX * s,
+                offsetY: transformGestureStartOverlay.offsetY * s,
+                scaleX: transformGestureStartOverlay.scaleX,
+                scaleY: transformGestureStartOverlay.scaleY,
+                rotationDeg: transformGestureStartOverlay.rotationDeg
+            )
+            return LayerGeometry.boundingBox(of: local, transform: t).center
+        case .watermark:
+            return CGPoint(
+                x: CGFloat(Double(compositePixelSize.width) * (1 - transformGestureStartWatermark.offsetFractionX)),
+                y: CGFloat(Double(compositePixelSize.height) * transformGestureStartWatermark.offsetFractionY)
+            )
+        case .psdText:
+            return transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize).center
+        }
     }
 
     private func applyTransformDrag(_ layer: SelectedLayer, canvas: CGPoint, commit: Bool) {
@@ -654,15 +706,12 @@ final class CanvasView: NSView {
                 t.offsetX += dx / s
                 t.offsetY += dy / s
             case .scale:
-                let center = overlayBox().center
-                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
-                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
-                t.scale = min(Self.maxScale, max(Self.minScale, t.scale * (nowDist / startDist)))
+                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
+                    t.scaleX = clampScale(t.scaleX * fx)
+                    t.scaleY = clampScale(t.scaleY * fy)
+                }
             case .rotate:
-                let center = overlayBox().center
-                let startAngle = atan2(Double(transformGestureStart.y - center.y), Double(transformGestureStart.x - center.x))
-                let nowAngle = atan2(Double(canvas.y - center.y), Double(canvas.x - center.x))
-                t.rotationDeg += (nowAngle - startAngle) * 180 / .pi
+                t.rotationDeg += rotateDelta(canvas: canvas)
             }
             overlayTransform = t
             onOverlayChanged?(t, commit, transformGestureOption)
@@ -674,15 +723,12 @@ final class CanvasView: NSView {
                 t.offsetFractionX -= dx / Double(compositePixelSize.width)
                 t.offsetFractionY += dy / Double(compositePixelSize.height)
             case .scale:
-                let center = watermarkBox().center
-                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
-                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
-                t.scale = min(Self.maxScale, max(Self.minScale, t.scale * (nowDist / startDist)))
+                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
+                    t.scaleX = clampScale(t.scaleX * fx)
+                    t.scaleY = clampScale(t.scaleY * fy)
+                }
             case .rotate:
-                let center = watermarkBox().center
-                let startAngle = atan2(Double(transformGestureStart.y - center.y), Double(transformGestureStart.x - center.x))
-                let nowAngle = atan2(Double(canvas.y - center.y), Double(canvas.x - center.x))
-                t.rotationDeg += (nowAngle - startAngle) * 180 / .pi
+                t.rotationDeg += rotateDelta(canvas: canvas)
             }
             watermarkTransform = t
             onWatermarkChanged?(t, commit, transformGestureOption)
@@ -711,9 +757,44 @@ final class CanvasView: NSView {
                 break
             }
             psdTextBox = b.clamped()
-            onPSDTextBoxChanged?(psdTextBox ?? .defaults, commit)
+            onPSDTextBoxChanged?(psdTextBox ?? .defaults, commit, transformGestureOption)
         }
         updateSelectionLayer()
+    }
+
+    private func clampScale(_ v: Double) -> Double {
+        min(Self.maxScale, max(Self.minScale, v))
+    }
+
+    /// Compute scale factors (x, y) from the fixed gesture anchor and the
+    /// dragged handle. Corners (and Shift) scale uniformly; edge/mid handles
+    /// stretch a single axis unless Shift is held.
+    private func applyScaleDrag(x: CGFloat, y: CGFloat, _ mutate: (Double, Double) -> Void) {
+        let anchor = transformGestureAnchor
+        let startX = Double(transformGestureStart.x - anchor.x)
+        let startY = Double(transformGestureStart.y - anchor.y)
+        let nowX = Double(x - anchor.x)
+        let nowY = Double(y - anchor.y)
+        let kind = transformGestureScaleHandle.map(scaleHandleKind) ?? .corner
+        if transformGestureShift || kind == .corner {
+            let startDist = max(1, hypot(startX, startY))
+            let nowDist = hypot(nowX, nowY)
+            let f = nowDist / startDist
+            mutate(f, f)
+        } else if kind == .edgeX {
+            guard abs(startX) > 0.0001 else { return }
+            mutate(nowX / startX, 1)
+        } else {
+            guard abs(startY) > 0.0001 else { return }
+            mutate(1, nowY / startY)
+        }
+    }
+
+    private func rotateDelta(canvas: CGPoint) -> Double {
+        let anchor = transformGestureAnchor
+        let startAngle = atan2(Double(transformGestureStart.y - anchor.y), Double(transformGestureStart.x - anchor.x))
+        let nowAngle = atan2(Double(canvas.y - anchor.y), Double(canvas.x - anchor.x))
+        return (nowAngle - startAngle) * 180 / .pi
     }
 
     private func hitRotateHandle(_ p: CGPoint, box: CGRect) -> Bool {
@@ -739,6 +820,7 @@ final class CanvasView: NSView {
         let item = DispatchWorkItem { [weak self] in
             self?.gestureActive = false
             self?.gestureEndWorkItem = nil
+            self?.preciseRotateAccum = 0
         }
         gestureEndWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Self.gestureIdleMs), execute: item)
@@ -919,6 +1001,7 @@ final class CanvasView: NSView {
         if commit {
             commitWorkItem?.cancel()
             commitWorkItem = nil
+            lastCommittedEdit = newEdit
         }
         onEdit?(newEdit, commit, scope)
     }
@@ -929,10 +1012,29 @@ final class CanvasView: NSView {
         let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.commitWorkItem = nil
+            // A discrete commit may already have captured this exact edit (e.g.
+            // a nudge or rotate within the 0.35 s debounce window); skip so the
+            // debounced commit never pushes a second undo step for the same value.
+            guard self.edit != self.lastCommittedEdit else { return }
+            self.lastCommittedEdit = self.edit
             self.onEdit?(self.edit, true, scope)
         }
         commitWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    /// Cancel any pending gesture/commit timers (call before switching images so
+    /// a stale debounced commit cannot land on the newly selected image).
+    func cancelPendingCommits() {
+        commitWorkItem?.cancel()
+        commitWorkItem = nil
+        lastCommittedEdit = nil
+        gestureEndWorkItem?.cancel()
+        gestureEndWorkItem = nil
+        gestureActive = false
+        preciseRotateAccum = 0
+        spacePending?.cancel()
+        spacePending = nil
     }
 
     /// Determine the global-edit scope from the current modifier keys:

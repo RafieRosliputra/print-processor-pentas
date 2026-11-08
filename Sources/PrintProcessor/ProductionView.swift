@@ -29,7 +29,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var files: [URL] = []
     private var currentIndex = 0
     private var edits = EditStore()
-    private var undoStacks: [String: UndoStack<ImageEdit>] = [:]
+    private var undoHistory = ImageUndoHistory()
     private var workingFolder: URL?
     private var settings = AppSettings.load()
     private let imageCache: ImageCache
@@ -50,6 +50,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var watermarkOpacitySlider: NSSlider?
     private var watermarkOpacityValue: NSTextField?
     private var overlayPathLabel: NSTextField?
+    private var overlayFitPopup: NSPopUpButton?
     private var gradientColourAWell: NSColorWell?
     private var gradientColourBWell: NSColorWell?
     private var gradientAngleSlider: NSSlider?
@@ -172,6 +173,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private func build() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.panel.cgColor
+        registerForDraggedTypes([.fileURL])
 
         let topBar = makeTopBar()
         let content = makeContentRow()
@@ -289,8 +291,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
         canvasView.onOverlayChanged = { [weak self] transform, commit, option in
             self?.handleOverlayChange(transform, commit: commit, option: option)
         }
-        canvasView.onPSDTextBoxChanged = { [weak self] box, commit in
-            self?.handlePSDTextBoxChanged(box, commit: commit)
+        canvasView.onPSDTextBoxChanged = { [weak self] box, commit, option in
+            self?.handlePSDTextBoxChanged(box, commit: commit, option: option)
         }
         canvasView.onMiddleClick = { [weak self] layer in
             self?.handleMiddleClick(layer)
@@ -732,7 +734,15 @@ final class ProductionView: NSView, NSTextViewDelegate {
         openButton.toolTip = "Open in Photoshop — open the layer-3 overlay file"
         overlayOpenButton = openButton
 
-        let stack = NSStackView(views: [loadButton, loadPSDButton, openButton, label])
+        let fitPopup = NSPopUpButton()
+        fitPopup.addItem(withTitle: "Fit")
+        fitPopup.addItem(withTitle: "Fill")
+        fitPopup.target = self
+        fitPopup.action = #selector(overlayFitChanged)
+        fitPopup.toolTip = "Fit/Fill — Fit letterboxes the overlay inside the canvas; Fill covers the canvas"
+        overlayFitPopup = fitPopup
+
+        let stack = NSStackView(views: [loadButton, loadPSDButton, openButton, labelRow("Fit/Fill", fitPopup), label])
         return makeBody(stack)
     }
 
@@ -928,6 +938,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         gradientBlendPopup?.selectItem(at: GradientBlend.allCases.firstIndex(of: layerSettings.gradient.blend) ?? 0)
         if case .colour(let c) = layerSettings.bg6 { bg6ColourWell?.color = colorFromRGB(c) }
         overlayPathLabel?.stringValue = pathSummary(layerSettings.overlay.path, empty: "No overlay loaded")
+        overlayFitPopup?.selectItem(at: layerSettings.overlay.fit ? 0 : 1)
         bg5PathLabel?.stringValue = pathSummary(layerSettings.bg5.path, empty: "No background image")
         bg6PathLabel?.stringValue = finalBackgroundSummary()
         watermarkSizeValue?.stringValue = formatPercent(layerSettings.watermark.sizeFraction)
@@ -938,7 +949,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         if let idx = TextAlign.allCases.firstIndex(of: layerSettings.psdText.align) {
             psdAlignPopup?.selectItem(at: idx)
         }
-        canvasView.psdTextBox = layerSettings.psdText.box
+        canvasView.psdTextBox = effectivePSDTextBox()
         canvasView.psdTextAlign = layerSettings.psdText.align
     }
 
@@ -988,6 +999,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
             self?.layerSettings.overlay.path = url.path
             self?.compositor.invalidateCache()
             self?.overlayPathLabel?.stringValue = url.lastPathComponent
+            self?.preloadLayerImages()
             self?.scheduleRenderPreview()
             self?.scheduleAutosave()
         }
@@ -1038,6 +1050,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
             self?.layerSettings.bg5.path = url.path
             self?.compositor.invalidateCache()
             self?.bg5PathLabel?.stringValue = url.lastPathComponent
+            self?.preloadLayerImages()
             self?.scheduleRenderPreview()
             self?.scheduleAutosave()
         }
@@ -1056,6 +1069,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
             self?.layerSettings.bg6 = .image(url.path)
             self?.compositor.invalidateCache()
             self?.bg6PathLabel?.stringValue = self?.finalBackgroundSummary() ?? ""
+            self?.preloadLayerImages()
             self?.scheduleRenderPreview()
             self?.scheduleAutosave()
         }
@@ -1091,11 +1105,48 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private func setPSDTextPath(_ path: String) {
         layerSettings.psdText.path = path
         psdTextPathLabel?.stringValue = URL(fileURLWithPath: path).lastPathComponent
-        canvasView.psdTextBox = layerSettings.psdText.box
+        canvasView.psdTextBox = effectivePSDTextBox()
         canvasView.psdTextAlign = layerSettings.psdText.align
         scheduleLayer2Render()
         scheduleRenderPreview()
         scheduleAutosave()
+    }
+
+    /// Route a dropped .psd to layer 2 (when its section is focused) or layer 3;
+    /// ask via an NSMenu when the target is ambiguous.
+    private func routeDroppedPSD(_ url: URL) {
+        let layer2Focused = sections[2]?.containsFirstResponder() == true
+        let layer3Focused = sections[3]?.containsFirstResponder() == true
+        if layer2Focused && !layer3Focused {
+            setPSDTextPath(url.path)
+        } else if layer3Focused && !layer2Focused {
+            setOverlayPSD(url)
+        } else {
+            let menu = NSMenu()
+            let l2 = NSMenuItem(title: "Layer 2 — PSD Text", action: #selector(droppedPSDToLayer2(_:)), keyEquivalent: "")
+            l2.target = self
+            l2.representedObject = url.path
+            let l3 = NSMenuItem(title: "Layer 3 — Overlay", action: #selector(droppedPSDToLayer3(_:)), keyEquivalent: "")
+            l3.target = self
+            l3.representedObject = url.path
+            menu.addItem(l2)
+            menu.addItem(l3)
+            if let window = window, let view = window.contentView {
+                let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+                let viewPoint = view.convert(windowPoint, from: nil)
+                menu.popUp(positioning: nil, at: viewPoint, in: view)
+            }
+        }
+    }
+
+    @objc private func droppedPSDToLayer2(_ item: NSMenuItem) {
+        guard let path = item.representedObject as? String else { return }
+        setPSDTextPath(path)
+    }
+
+    @objc private func droppedPSDToLayer3(_ item: NSMenuItem) {
+        guard let path = item.representedObject as? String else { return }
+        setOverlayPSD(URL(fileURLWithPath: path))
     }
 
     @objc private func drawPSDBoxClicked() {
@@ -1188,11 +1239,26 @@ final class ProductionView: NSView, NSTextViewDelegate {
         psdPreviewLabel?.stringValue = lines.isEmpty ? "No files — scan preview appears here." : lines.joined(separator: "\n")
     }
 
-    private func handlePSDTextBoxChanged(_ box: PSDTextBox, commit: Bool) {
-        layerSettings.psdText.box = box
+    private func handlePSDTextBoxChanged(_ box: PSDTextBox, commit: Bool, option: Bool) {
+        if option {
+            // Option-drag writes a per-image override.
+            if let key = currentKey() {
+                edits.setPSDBoxOverride(box, sizeKey: key.sizeKey, fileName: key.fileName)
+            }
+        } else {
+            layerSettings.psdText.box = box
+        }
         canvasView.psdTextBox = box
         scheduleRenderPreview()
         if commit { scheduleAutosave() }
+    }
+
+    /// The layer-2 box for the current image: per-image override or the global.
+    private func effectivePSDTextBox() -> PSDTextBox {
+        if let key = currentKey(), let override = edits.psdBoxOverride(sizeKey: key.sizeKey, fileName: key.fileName) {
+            return override
+        }
+        return layerSettings.psdText.box
     }
 
     private func runnerForRender() -> PhotoshopRunnerProtocol {
@@ -1205,10 +1271,12 @@ final class ProductionView: NSView, NSTextViewDelegate {
         return base.path
     }
 
-    private func layer2BoxPixelWidth() -> CGFloat {
+    private func layer2BoxPixelSize() -> CGSize {
         let canvas = canvasPixelSize()
-        guard canvas.width > 0 else { return 1000 }
-        return CGFloat(layerSettings.psdText.box.width) * canvas.width
+        guard canvas.width > 0, canvas.height > 0 else { return CGSize(width: 1000, height: 1000) }
+        let box = effectivePSDTextBox()
+        return CGSize(width: CGFloat(box.width) * canvas.width,
+                      height: CGFloat(box.height) * canvas.height)
     }
 
     private func scheduleLayer2Render() {
@@ -1221,7 +1289,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         let psdPath = layerSettings.psdText.path
         let layerName = settings.psdTextLayerName.isEmpty ? "TEXT" : settings.psdTextLayerName
         let cacheDir = cacheDirectory()
-        let boxWidth = layer2BoxPixelWidth()
+        let boxSize = layer2BoxPixelSize()
         let fileName = currentFileName()
         let sizeKey = currentSizeKey()
         let manualText = edits.manualText(sizeKey: sizeKey, fileName: fileName) ?? ""
@@ -1240,7 +1308,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         psdTextRenderer = renderer
 
         photoshopQueue.async { [weak self] in
-            let image = renderer.render(psdPath: psdPath, text: text, boxWidth: boxWidth)
+            let image = renderer.render(psdPath: psdPath, text: text, boxSize: boxSize)
             DispatchQueue.main.async {
                 guard let self = self, gen == self.layer2RenderGeneration else { return }
                 self.compositor.layer2Image = image
@@ -1280,6 +1348,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
                     self.layerSettings.overlay.path = out.path
                     self.compositor.invalidateCache()
                     self.overlayPathLabel?.stringValue = out.lastPathComponent
+                    self.preloadLayerImages()
                     self.scheduleRenderPreview()
                     self.scheduleAutosave()
                     self.startOverlayWatcher(url)
@@ -1308,14 +1377,43 @@ final class ProductionView: NSView, NSTextViewDelegate {
                             self.layerSettings.overlay.path = out.path
                             self.compositor.invalidateCache()
                             self.overlayPathLabel?.stringValue = out.lastPathComponent
+                            self.preloadLayerImages()
                             self.scheduleRenderPreview()
                             self.scheduleAutosave()
+                            // Re-arm after a save/rename so the watch stays on
+                            // the current file (Photoshop may replace/rename it).
+                            self.startOverlayWatcher(psdURL)
                         }
                     }
                 }
             }
         }
         overlayWatcher?.start()
+    }
+
+    /// Restore a persisted layer-3 PSD path: re-arm the watcher and reload the
+    /// newest numbered webp beside it (used when reopening a saved project).
+    private func restoreOverlayPSD(_ path: String) {
+        overlayPSDPath = path
+        overlayOpenButton?.isEnabled = !path.isEmpty
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { return }
+        let psdURL = URL(fileURLWithPath: path)
+        if let newest = WebPNumbering.existingNumbers(psdURL: psdURL).max() {
+            let candidate = WebPNumbering.outputURL(psdURL: psdURL, number: newest)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                layerSettings.overlay.path = candidate.path
+                compositor.invalidateCache()
+            }
+        }
+        startOverlayWatcher(psdURL)
+    }
+
+    @objc private func overlayFitChanged() {
+        layerSettings.overlay.fit = overlayFitPopup?.indexOfSelectedItem == 0
+        compositor.invalidateCache()
+        updateLayerSelectionState()
+        scheduleRenderPreview()
+        scheduleAutosave()
     }
 
     @objc private func openOverlayInPhotoshop() {
@@ -1379,17 +1477,20 @@ final class ProductionView: NSView, NSTextViewDelegate {
         alert.addButton(withTitle: "Cancel")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            if hadOriginal {
-                let number = WebPNumbering.nextNumber(psdURL: original, counter: -1)
-                let out = WebPNumbering.outputURL(psdURL: original, number: number)
-                try? FileManager.default.copyItem(at: original, to: out)
-                try? FileManager.default.removeItem(at: original)
-                try? FileManager.default.moveItem(at: backup, to: original)
+            // Save the edited copy as a new numbered WebP (re-encoded, never a
+            // raw byte copy under a .webp name), restore the original.
+            let number = WebPNumbering.nextNumber(psdURL: original, counter: -1)
+            let cwebp = settings.cwebpPath
+            PhotoEditSave.saveAsNewVersion(original: original, backup: backup, hadBackup: hadOriginal,
+                                           number: number) { image, url in
+                WebPEncoder(cwebpPath: cwebp).encode(image: image, to: url)
             }
         case .alertSecondButtonReturn:
-            try? FileManager.default.removeItem(at: backup)
+            // Replace original: keep the edited copy, drop the backup.
+            PhotoEditSave.replaceOriginal(backup: backup)
         default:
-            try? FileManager.default.removeItem(at: backup)
+            // Cancel: discard the edited copy and restore the untouched original.
+            PhotoEditSave.cancel(original: original, backup: backup, hadBackup: hadOriginal)
         }
         scheduleRenderPreview()
     }
@@ -1437,7 +1538,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         // Snapshot everything the parallel render needs off the main thread.
         let project = makeProjectModel()
         let layer2Image = compositor.layer2Image
-        let layer2Box = layerSettings.psdText.box
+        let layer2Box = effectivePSDTextBox()
         let layer2Align = layerSettings.psdText.align
         let scanMode = settings.scanMode
         let cache = imageCache
@@ -1563,7 +1664,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
         let project = makeProjectModel()
         let layer2Image = compositor.layer2Image
-        let layer2Box = layerSettings.psdText.box
+        let layer2Box = effectivePSDTextBox()
         let layer2Align = layerSettings.psdText.align
         let scanMode = settings.scanMode
         let cache = imageCache
@@ -1721,37 +1822,49 @@ final class ProductionView: NSView, NSTextViewDelegate {
     // MARK: - Import
 
     private func importFiles(_ urls: [URL]) {
+        // Route dropped .psd files to a PSD layer (2 if its section is focused,
+        // otherwise 3; ask when ambiguous) instead of treating them as photos.
+        let psdURLs = urls.filter { $0.pathExtension.lowercased() == "psd" }
+        let photoURLs = urls.filter { $0.pathExtension.lowercased() != "psd" }
+        for psd in psdURLs {
+            routeDroppedPSD(psd)
+        }
         guard selectedSize != nil else { return }
-        let collected = PhotoImport.naturalSorted(PhotoImport.collectFiles(from: urls))
+        let collected = PhotoImport.naturalSorted(PhotoImport.collectFiles(from: photoURLs))
         guard !collected.isEmpty else { return }
 
         let folder = collected[0].deletingLastPathComponent()
         workingFolder = folder
         UserDefaults.standard.set(folder.path, forKey: Self.lastFolderKey)
 
+        // Load first: loadRecovering creates the .bak only when the JSON is
+        // corrupt, so the recovery flag must be read after the load attempt.
+        let recovered = ProjectModel.loadRecovering(from: folder.path)
         let corrupt = ProjectModel.hasRecoveryBackup(in: folder.path)
-        if let existing = ProjectModel.loadRecovering(from: folder.path),
-           existing.workingFolder == folder.path {
+        if let existing = recovered, existing.workingFolder == folder.path {
             edits = existing.edits
             layerSettings = existing.layerSettings
             psdTextList = existing.psdTextList
             overlayCounter = existing.overlayCounter
+            overlayPSDPath = existing.overlayPSDPath
         } else {
             edits = EditStore()
             layerSettings = .defaults
             psdTextList = [:]
             overlayCounter = -1
+            overlayPSDPath = ""
         }
 
         files = collected
         currentIndex = 0
-        undoStacks.removeAll()
+        undoHistory.clear()
         lastEdit = nil
         gestureBaseline = nil
 
         imageCache.prime(files: files)
 
         applyAutoOrientation(firstPhotoURL: collected[0])
+        restoreOverlayPSD(overlayPSDPath)
         applyLayerSettingsToUI()
         showCurrentImage()
         updateStatus()
@@ -1759,6 +1872,28 @@ final class ProductionView: NSView, NSTextViewDelegate {
             showRecoveryMessage()
         }
         scheduleAutosave()
+    }
+
+    // MARK: - Drag & drop (panel + chrome, outside the canvas)
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard !droppedFileURLs(sender).isEmpty else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = droppedFileURLs(sender)
+        guard !urls.isEmpty else { return false }
+        importFiles(urls)
+        return true
+    }
+
+    private func droppedFileURLs(_ sender: NSDraggingInfo) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let objects = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [NSURL] else {
+            return []
+        }
+        return objects.map { $0 as URL }
     }
 
     // MARK: - Navigation
@@ -1787,6 +1922,9 @@ final class ProductionView: NSView, NSTextViewDelegate {
         currentIndex = max(0, min(files.count - 1, index))
         lastEdit = nil
         gestureBaseline = nil
+        // Undo history is per image and cleared when switching (SPEC §2).
+        undoHistory.clear()
+        canvasView.cancelPendingCommits()
         imageCache.prefetch(urls: files, around: currentIndex)
         showCurrentImage()
         scheduleAutosave()
@@ -1805,8 +1943,11 @@ final class ProductionView: NSView, NSTextViewDelegate {
         canvasView.edit = currentEdit()
         updateWatermarkPlaceholder()
         updateLayerSelectionState()
+        canvasView.psdTextBox = effectivePSDTextBox()
+        canvasView.psdTextAlign = layerSettings.psdText.align
         psdManualTextField?.stringValue = edits.manualText(sizeKey: currentSizeKey(), fileName: url.lastPathComponent) ?? ""
         scheduleLayer2Render()
+        preloadLayerImages()
         loadPreview(for: url)
         updateStatus()
     }
@@ -1866,7 +2007,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         }
         let preview = previewPixelSize()
         let project = makeProjectModel()
-        compositor.layer2Box = layerSettings.psdText.box
+        compositor.layer2Box = effectivePSDTextBox()
         compositor.layer2Align = layerSettings.psdText.align
         compositor.scanMode = settings.scanMode
         let image = compositor.render(project: project, imageIndex: currentIndex, canvasPixelSize: preview,
@@ -1898,8 +2039,25 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func overlayImage() -> CGImage? {
         guard !layerSettings.overlay.path.isEmpty else { return nil }
-        let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: layerSettings.overlay.path) as CFURL, nil)
-        return source.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        return DecodedImageCache.shared.cached(layerSettings.overlay.path)
+    }
+
+    /// Decode the overlay/background images off the main thread into the shared
+    /// path+mtime cache so preview renders never re-decode them on main.
+    private func preloadLayerImages() {
+        for path in layerImagePaths() {
+            DecodedImageCache.shared.load(path) { [weak self] _ in
+                self?.scheduleRenderPreview()
+            }
+        }
+    }
+
+    private func layerImagePaths() -> [String] {
+        var paths: [String] = []
+        if !layerSettings.overlay.path.isEmpty { paths.append(layerSettings.overlay.path) }
+        if !layerSettings.bg5.path.isEmpty { paths.append(layerSettings.bg5.path) }
+        if case .image(let p) = layerSettings.bg6, !p.isEmpty { paths.append(p) }
+        return paths
     }
 
     private func updateLayerSelectionState() {
@@ -1963,14 +2121,11 @@ final class ProductionView: NSView, NSTextViewDelegate {
         lastEdit = newEdit
 
         if commit {
-            // The current image is always one undoable step.
+            // Global (Cmd+Shift/Shift) edits push ONE undo step on the current
+            // image only; the other images are overwritten without their own step.
             pushUndo(fileName: fileName, value: gestureBaseline ?? old)
             if scope != .none {
                 let names = files.map { $0.lastPathComponent }
-                for target in globalTargets(scope: scope, fileNames: names) where target != fileName {
-                    let prior = edits.edit(sizeKey: key.sizeKey, fileName: target) ?? .identity
-                    pushUndo(fileName: target, value: prior)
-                }
                 edits.applyGlobalEdit(newEdit, scope: scope, sizeKey: key.sizeKey,
                                       files: names, currentIndex: currentIndex)
             }
@@ -1980,28 +2135,14 @@ final class ProductionView: NSView, NSTextViewDelegate {
         scheduleAutosave()
     }
 
-    private func globalTargets(scope: GlobalEditScope, fileNames: [String]) -> [String] {
-        switch scope {
-        case .none: return []
-        case .all: return fileNames
-        case .after:
-            guard fileNames.indices.contains(currentIndex) else { return [] }
-            return Array(fileNames.dropFirst(currentIndex + 1))
-        }
-    }
-
     private func pushUndo(fileName: String, value: ImageEdit) {
-        var stack = undoStacks[fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
-        stack.push(value)
-        undoStacks[fileName] = stack
+        undoHistory.push(fileName: fileName, value: value)
     }
 
     private func undo() {
         guard let key = currentKey() else { return }
-        var stack = undoStacks[key.fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
         let current = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
-        guard let previous = stack.undo(current: current) else { return }
-        undoStacks[key.fileName] = stack
+        guard let previous = undoHistory.undo(fileName: key.fileName, current: current) else { return }
         edits.setEdit(previous, sizeKey: key.sizeKey, fileName: key.fileName)
         lastEdit = previous
         canvasView.edit = previous
@@ -2011,10 +2152,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func redo() {
         guard let key = currentKey() else { return }
-        var stack = undoStacks[key.fileName] ?? UndoStack<ImageEdit>(maxCount: 50)
         let current = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
-        guard let next = stack.redo(current: current) else { return }
-        undoStacks[key.fileName] = stack
+        guard let next = undoHistory.redo(fileName: key.fileName, current: current) else { return }
         edits.setEdit(next, sizeKey: key.sizeKey, fileName: key.fileName)
         lastEdit = next
         canvasView.edit = next
@@ -2074,7 +2213,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
             edits: edits,
             layerSettings: layerSettings,
             psdTextList: psdTextList,
-            overlayCounter: overlayCounter
+            overlayCounter: overlayCounter,
+            overlayPSDPath: overlayPSDPath
         )
     }
 
@@ -2132,11 +2272,13 @@ final class ProductionView: NSView, NSTextViewDelegate {
                 layerSettings = model.layerSettings
                 psdTextList = model.psdTextList
                 overlayCounter = model.overlayCounter
+                overlayPSDPath = model.overlayPSDPath
                 selectedSize = model.selectedSize
                 syncSizeButtons()
                 applyOrientationToCanvas()
                 imageCache.prime(files: files)
                 applyAutoOrientation(firstPhotoURL: urls[0])
+                restoreOverlayPSD(overlayPSDPath)
                 applyLayerSettingsToUI()
                 showCurrentImage()
                 updateStatus()
@@ -2158,6 +2300,7 @@ final class ProductionView: NSView, NSTextViewDelegate {
         layerSettings = .defaults
         psdTextList = [:]
         overlayCounter = -1
+        overlayPSDPath = ""
         selectedSize = nil
         syncSizeButtons()
         applyOrientationToCanvas()

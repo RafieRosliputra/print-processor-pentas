@@ -152,6 +152,21 @@ public struct AppSettings: Codable, Equatable {
         try c.encode(cpuLimit, forKey: .cpuLimit)
     }
 
+    /// Clamp every numeric field to its documented bounds so out-of-range input
+    /// (e.g. typed in the Settings tab) can never produce an invalid value.
+    /// rotateStep 0.01…1.5, scroll speeds > 0, doubleTapMs 100…1000,
+    /// tooltipDelay >= 0, minTextScale 0.05…1.
+    public func clamped() -> AppSettings {
+        var s = self
+        s.doubleTapMs = min(1000, max(100, doubleTapMs))
+        s.rotateStep = min(1.5, max(0.01, rotateStep))
+        s.scrollZoomSpeed = max(0.01, scrollZoomSpeed)
+        s.scrollRotateSpeed = max(0.01, scrollRotateSpeed)
+        s.tooltipDelay = max(0, tooltipDelay)
+        s.minTextScale = min(1, max(0.05, minTextScale))
+        return s
+    }
+
     private static let storageKey = "com.johorstudio.printprocessor.AppSettings"
 
     /// Load the persisted settings, falling back to defaults when nothing is stored yet.

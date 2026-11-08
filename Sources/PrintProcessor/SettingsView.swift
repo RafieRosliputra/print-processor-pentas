@@ -88,7 +88,7 @@ final class SettingsView: NSView {
             ("Rotate step (°)", rotateStepField, "Rotate step — degrees per scroll while holding R. Shortcut: R + scroll"),
             ("Scroll zoom speed", zoomSpeedField, "Scroll zoom speed — zoom sensitivity multiplier. Shortcut: scroll"),
             ("Scroll rotate speed", rotateSpeedField, "Scroll rotate speed — rotation sensitivity multiplier. Shortcut: R + scroll"),
-            ("Nudge pixel basis", nudgePopup, "Nudge basis — export or screen pixels. Shortcut: arrows (1 px) / Shift+arrows (10 px)"),
+            ("Nudge pixel basis", nudgePopup, "Nudge basis — export or screen pixels. Shortcut: Up/Down (1 px) / Shift+arrows (10 px)"),
             ("Tooltip delay (s)", tooltipDelayField, "Tooltip delay — seconds before a tooltip appears (0 disables)"),
             ("Filename scan mode", scanModeField, "Scan mode — which side of \" - \" goes to layer 2/1 (e.g. text=right or text=left,watermark=right)"),
             ("PSD text layer name", textLayerNameField, "Text layer name — the layer targeted in Photoshop for layer 2 (default TEXT)"),

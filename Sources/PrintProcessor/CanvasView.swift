@@ -1339,8 +1339,12 @@ final class CanvasView: NSView {
             onTogglePreviewFull?()
             return
         }
-        // Nudge (arrow keys, fixed 1 px / Shift 10 px).
+        // Nudge (Up/Down 1 px, Shift+arrows 10 px; plain Left/Right switch files).
         let shift = event.modifierFlags.contains(.shift)
+        // Plain Left / Right = previous / next file (like double-Space / Space).
+        let plainArrow = event.modifierFlags.intersection([.shift, .command, .option, .control]).isEmpty
+        if plainArrow && event.keyCode == 123 { onPreviousFile?(); return }
+        if plainArrow && event.keyCode == 124 { onNextFile?(); return }
         switch event.keyCode {
         case 123: nudge(dx: shift ? -10 : -1, dy: 0, scope: scope)
         case 124: nudge(dx: shift ? 10 : 1, dy: 0, scope: scope)

@@ -478,6 +478,93 @@ func exportIntProp(_ props: [CFString: Any]?, _ key: CFString) -> Int {
     return (v as? NSNumber)?.intValue ?? (v as? Int) ?? 0
 }
 
+// MARK: - Metadata segment scanners (acceptance checks)
+
+/// Results of a byte-level JPEG marker scan.
+struct JPEGSegments {
+    var app1Count = 0      // Exif / XMP APP1 markers
+    var iccAPP2 = false    // APP2 "ICC_PROFILE" present
+    var jfifUnits = -1     // 1 = dots/inch
+    var jfifXDensity = -1
+    var jfifYDensity = -1
+}
+
+/// Walk a JPEG's markers and report APP1 count, ICC APP2 presence, and JFIF
+/// density. Returns nil for a malformed file.
+func scanJPEGSegments(_ path: String) -> JPEGSegments? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+    let b = [UInt8](data)
+    guard b.count >= 4, b[0] == 0xFF, b[1] == 0xD8 else { return nil }
+    var result = JPEGSegments()
+    var i = 2
+    while i < b.count {
+        guard b[i] == 0xFF else { return nil }
+        var j = i + 1
+        while j < b.count && b[j] == 0xFF { j += 1 }
+        guard j < b.count else { return nil }
+        let marker = b[j]
+        if marker == 0xD9 || marker == 0xDA { break }
+        if marker == 0x00 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7) {
+            i = j + 1
+            continue
+        }
+        guard j + 2 < b.count else { return nil }
+        let length = (Int(b[j + 1]) << 8) | Int(b[j + 2])
+        guard length >= 2 else { return nil }
+        let end = j + 1 + length
+        guard end <= b.count else { return nil }
+        let payload = Array(b[(j + 3)..<end])
+        switch marker {
+        case 0xE0:
+            if payload.count >= 12, payload[0] == 0x4A, payload[1] == 0x46, payload[2] == 0x49,
+               payload[3] == 0x46, payload[4] == 0x00 {
+                result.jfifUnits = Int(payload[7])
+                result.jfifXDensity = (Int(payload[8]) << 8) | Int(payload[9])
+                result.jfifYDensity = (Int(payload[10]) << 8) | Int(payload[11])
+            }
+        case 0xE1:
+            result.app1Count += 1
+        case 0xE2:
+            if payload.count >= 12, payload[0] == 0x49, payload[1] == 0x43, payload[2] == 0x43,
+               payload[3] == 0x5F, payload[4] == 0x50, payload[5] == 0x52, payload[6] == 0x4F,
+               payload[7] == 0x46, payload[8] == 0x49, payload[9] == 0x4C, payload[10] == 0x45,
+               payload[11] == 0x00 {
+                result.iccAPP2 = true
+            }
+        default:
+            break
+        }
+        i = end
+    }
+    return result
+}
+
+/// Results of a WebP RIFF chunk scan.
+struct WebPChunks {
+    var hasICCP = false
+    var hasEXIF = false
+    var hasXMP = false
+}
+
+/// Walk a WebP's RIFF chunks and report ICCP / EXIF / XMP presence.
+func scanWebPChunks(_ path: String) -> WebPChunks? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+    let b = [UInt8](data)
+    guard b.count >= 12, b[0] == 0x52, b[1] == 0x49, b[2] == 0x46, b[3] == 0x46,
+          b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 else { return nil }
+    var result = WebPChunks()
+    var i = 12
+    while i + 8 <= b.count {
+        let fourcc = String(bytes: b[i..<i + 4], encoding: .ascii) ?? ""
+        let size = Int(b[i + 4]) | (Int(b[i + 5]) << 8) | (Int(b[i + 6]) << 16) | (Int(b[i + 7]) << 24)
+        if fourcc == "ICCP" { result.hasICCP = true }
+        if fourcc == "EXIF" { result.hasEXIF = true }
+        if fourcc == "XMP " { result.hasXMP = true }
+        i += 8 + size + (size & 1)
+    }
+    return result
+}
+
 /// Run a JPG-only export to completion, spinning the main run loop so the
 /// ExportJob's main-queue completion can fire.
 func runExportSync(
@@ -568,6 +655,16 @@ do {
     let decoded = src.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
     check(decoded?.width == 1200 && decoded?.height == 1800,
           "JPG size = paper pixels (got \(decoded?.width ?? 0)x\(decoded?.height ?? 0))")
+
+    // Byte-level segment scan: no APP1 Exif/XMP, ICC APP2 present, JFIF 300 dpi.
+    if let segs = scanJPEGSegments(url.path) {
+        check(segs.app1Count == 0, "JPG has no APP1 Exif/XMP segments (found \(segs.app1Count))")
+        check(segs.iccAPP2, "JPG has an ICC APP2 profile segment")
+        check(segs.jfifUnits == 1 && segs.jfifXDensity == 300 && segs.jfifYDensity == 300,
+              "JPG JFIF density is 300 dpi (units=\(segs.jfifUnits) xd=\(segs.jfifXDensity) yd=\(segs.jfifYDensity))")
+    } else {
+        check(false, "JPG segment scan")
+    }
 }
 
 // 4. Parallel export of 8 files; every output exists.
@@ -643,8 +740,57 @@ if WebPEncoder.isAvailable {
     } else {
         check(false, "WebP decodes for long-edge check")
     }
+    if let chunks = scanWebPChunks(out.path) {
+        check(chunks.hasICCP, "WebP has an ICCP chunk")
+        check(!chunks.hasEXIF && !chunks.hasXMP, "WebP has no EXIF/XMP chunk")
+    } else {
+        check(false, "WebP RIFF chunk scan")
+    }
 } else {
     print("[skip] cwebp not found — WebP export check skipped")
+}
+
+// MARK: - Cancel export (queued units short-circuit; remaining files unwritten)
+
+do {
+    let tmp = makeTempDir("canceltest")
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    var files: [URL] = []
+    for i in 0..<10 {
+        let u = URL(fileURLWithPath: tmp).appendingPathComponent("\(i).png")
+        _ = writePNG(makeSolidImage(width: 20, height: 20, r: 0, g: 1, b: 0, a: 1)!, to: u)
+        files.append(u)
+    }
+    let renderStarted = DispatchSemaphore(value: 0)
+    let job = ExportJob(
+        files: files,
+        formats: [.jpg],
+        exportRoot: URL(fileURLWithPath: tmp),
+        settings: ExportSettings(exportJPG: true, exportWebP: false),
+        paperPixelSize: CGSize(width: 40, height: 40),
+        sizeLabel: "4x6",
+        cwebpPath: "",
+        cpuLimit: 1,   // serial queue: later units wait behind the first render
+        render: { index, canvas in
+            if index == 0 {
+                renderStarted.signal()
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            return makeSolidImage(width: Int(canvas.width), height: Int(canvas.height), r: 1, g: 1, b: 1, a: 1)
+        }
+    )
+    var summary = ExportSummary()
+    var done = false
+    job.run(resolutions: [:]) { s in summary = s; done = true }
+    _ = renderStarted.wait(timeout: .now() + 5)
+    job.cancel()
+    let deadline = Date().addingTimeInterval(30)
+    while !done && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    check(summary.cancelled, "cancel marks the summary cancelled")
+    check(summary.total == 10, "cancel reports total units (got \(summary.total))")
+    check(summary.totalWritten < 10, "cancel stops remaining files (wrote \(summary.totalWritten)/10)")
 }
 
 // MARK: - Polish additions (symlink guard, clamp, shrink, PSD paths, concurrent cache)

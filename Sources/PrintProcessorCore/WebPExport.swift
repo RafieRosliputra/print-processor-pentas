@@ -101,9 +101,10 @@ public final class WebPEncoder {
         }
     }
 
-    /// Encode for final export: alpha channel disabled and all metadata stripped
-    /// (no EXIF / ICC / XMP). The image is written at its current size; sizing to
-    /// a long edge is handled by the caller's render step.
+    /// Encode for final export: alpha channel disabled, the sRGB ICC profile
+    /// embedded, and EXIF / XMP / GPS stripped (`-metadata icc` copies only the
+    /// ICC profile from the source PNG). The image is written at its current
+    /// size; sizing to a long edge is handled by the caller's render step.
     @discardableResult
     public func encodeExport(image: CGImage, to url: URL) -> Bool {
         guard let cwebp = cwebpPath.isEmpty ? Self.resolveCWebP() : cwebpPath,
@@ -113,7 +114,7 @@ public final class WebPEncoder {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: cwebp)
-        process.arguments = ["-q", String(quality), "-noalpha", "-metadata", "none", tmp, "-o", url.path]
+        process.arguments = ["-q", String(quality), "-noalpha", "-metadata", "icc", tmp, "-o", url.path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -125,6 +126,8 @@ public final class WebPEncoder {
         }
     }
 
+    /// Write the image as a temp PNG and embed the sRGB ICC profile as an iCCP
+    /// chunk so `cwebp -metadata icc` can copy it into the WebP's ICCP chunk.
     private static func writeTempPNG(_ image: CGImage, in directory: URL) -> String? {
         let url = directory.appendingPathComponent(".pp-cwebp-\(UUID().uuidString).png")
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
@@ -132,6 +135,9 @@ public final class WebPEncoder {
         }
         CGImageDestinationAddImage(dest, image, nil)
         guard CGImageDestinationFinalize(dest) else { return nil }
+        if let icc = ICCProfile.sRGBData() {
+            ICCProfile.injectICC(intoPNGAt: url, icc: icc)
+        }
         return url.path
     }
 }

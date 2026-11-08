@@ -107,6 +107,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var exportJob: ExportJob?
     private var applyAllCollisionPolicy: CollisionPolicy?
     private var renderButton: NSButton?
+    private var processButton: NSButton?
+    private var cancelButton: NSButton?
     private var quickLookURL: URL?
     private var spaceCloseMonitor: Any?
 
@@ -222,9 +224,18 @@ final class ProductionView: NSView, NSTextViewDelegate {
         processButton.controlSize = .regular
         processButton.bezelColor = .glow
         processButton.contentTintColor = .black
-        processButton.toolTip = "Process — render and export the current image (no shortcut)"
+        let processShortcut = ShortcutStore.shared.entry(.process)?.display ?? "⌘P"
+        processButton.toolTip = "Process — render and export every photo (Shortcut: \(processShortcut))"
+        self.processButton = processButton
 
-        let controlsRow = NSStackView(views: [sizeStack, processButton])
+        let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancelExportClicked))
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .regular
+        cancelButton.toolTip = "Cancel — stop exporting the remaining files"
+        cancelButton.isHidden = true
+        self.cancelButton = cancelButton
+
+        let controlsRow = NSStackView(views: [sizeStack, processButton, cancelButton])
         controlsRow.orientation = .horizontal
         controlsRow.alignment = .centerY
         controlsRow.spacing = 10
@@ -1578,12 +1589,23 @@ final class ProductionView: NSView, NSTextViewDelegate {
         }
 
         exportJob = job
+        processButton?.isEnabled = false
+        cancelButton?.isHidden = false
+        cancelButton?.isEnabled = true
         job.onProgress = { [weak self] progress in
             self?.updateExportProgress(progress)
         }
         job.run(resolutions: resolutions) { [weak self] summary in
             self?.finishExport(summary)
         }
+    }
+
+    @objc private func cancelExportClicked() {
+        guard exportJob?.isRunning == true else { return }
+        exportJob?.cancel()
+        cancelButton?.isEnabled = false
+        statusLabel.textColor = .systemRed
+        statusLabel.stringValue = "Cancelling…"
     }
 
     /// Ask the user how to handle an existing output file. The NSAlert carries a
@@ -1629,6 +1651,16 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     private func finishExport(_ summary: ExportSummary) {
         exportJob = nil
+        processButton?.isEnabled = true
+        cancelButton?.isHidden = true
+        cancelButton?.isEnabled = true
+
+        if summary.cancelled {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "Cancelled \(summary.totalWritten)/\(summary.total)"
+            return
+        }
+
         var parts: [String] = []
         if summary.jpgWritten > 0 || settings.export.exportJPG {
             parts.append("JPG – \(summary.jpgWritten) files")
@@ -1639,9 +1671,6 @@ final class ProductionView: NSView, NSTextViewDelegate {
         if summary.failed > 0 {
             statusLabel.textColor = .systemRed
             parts.append("\(summary.failed) failed")
-        } else if summary.cancelled {
-            statusLabel.textColor = .systemRed
-            parts.append("cancelled")
         } else {
             statusLabel.textColor = .dimText
         }

@@ -133,8 +133,10 @@ public enum ExportNaming {
 }
 
 /// Writes a rendered `CGImage` to JPEG with 300-dpi metadata, an embedded sRGB
-/// profile, and no EXIF / copyright metadata (the image is a fresh render, so
-/// no source metadata is ever carried over).
+/// ICC profile, and no EXIF / XMP metadata. ImageIO cannot omit the minimal
+/// Exif APP1 it adds (nor does it write an ICC APP2), so the encoded file is
+/// rewritten segment-by-segment: drop APP1, force JFIF to 300 dpi, and embed
+/// the sRGB profile as an APP2 ICC_PROFILE marker.
 public enum JPEGWriter {
     /// Map Photoshop-scale quality (0…12) to ImageIO's 0…1 compression value.
     public static func compressionQuality(photoshop: Int) -> Double {
@@ -158,7 +160,102 @@ public enum JPEGWriter {
             kCGImageDestinationLossyCompressionQuality: compressionQuality(photoshop: quality),
         ]
         CGImageDestinationSetProperties(dest, destProps as CFDictionary)
-        return CGImageDestinationFinalize(dest)
+        guard CGImageDestinationFinalize(dest) else { return false }
+
+        // Rewrite the encoded JPEG: strip APP1 Exif/XMP, embed ICC APP2, force
+        // JFIF density to `dpi` dots/inch. Metadata rewriting is best-effort —
+        // the encoded JPEG is still valid and already written if it fails.
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(".pp-strip-\(UUID().uuidString).jpg")
+        guard JPEGMetadataStripper.strip(source: url, destination: tmp, dpi: dpi) else {
+            return true
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return true
+        }
+    }
+}
+
+/// Byte-level JPEG segment rewriter: keeps SOI, JFIF APP0 (density forced to
+/// `dpi` dots/inch), an embedded ICC APP2, and every other segment, while
+/// dropping every APP1 marker (Exif and XMP).
+public enum JPEGMetadataStripper {
+    @discardableResult
+    public static func strip(source: URL, destination: URL, dpi: Int = 300) -> Bool {
+        guard let data = try? Data(contentsOf: source) else { return false }
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4, bytes[0] == 0xFF, bytes[1] == 0xD8 else { return false }
+        let icc = ICCProfile.sRGBData()
+
+        var out: [UInt8] = [0xFF, 0xD8]
+        var iccInjected = false
+        func injectICCIfNeeded() {
+            guard !iccInjected, let icc = icc else { return }
+            out.append(contentsOf: ICCProfile.jpegICCAPP2(icc))
+            iccInjected = true
+        }
+
+        var i = 2
+        while i < bytes.count {
+            guard bytes[i] == 0xFF else { return false }
+            var j = i + 1
+            while j < bytes.count && bytes[j] == 0xFF { j += 1 }
+            guard j < bytes.count else { return false }
+            let marker = bytes[j]
+
+            if marker == 0xD9 {         // EOI (standalone, no length field)
+                injectICCIfNeeded()
+                out.append(0xFF); out.append(0xD9)
+                break
+            }
+            if marker == 0xDA {         // SOS: entropy-coded data through EOI
+                injectICCIfNeeded()
+                out.append(contentsOf: bytes[(j - 1)...])
+                break
+            }
+            if marker == 0x00 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7) {
+                out.append(0xFF); out.append(marker)
+                i = j + 1
+                continue
+            }
+            guard j + 2 < bytes.count else { return false }
+            let length = (Int(bytes[j + 1]) << 8) | Int(bytes[j + 2])
+            guard length >= 2 else { return false }
+            let end = j + 1 + length
+            guard end <= bytes.count else { return false }
+
+            if marker == 0xE1 {         // APP1: Exif / XMP — drop
+                i = end
+                continue
+            }
+            if marker == 0xE0 {
+                var seg = Array(bytes[(j - 1)..<end])
+                // Force the JFIF density header to dots/inch at `dpi`.
+                if seg.count >= 16, seg[4] == 0x4A, seg[5] == 0x46, seg[6] == 0x49, seg[7] == 0x46, seg[8] == 0x00 {
+                    seg[11] = 1                                        // units = dots/inch
+                    seg[12] = UInt8((dpi >> 8) & 0xFF)                 // Xdensity hi
+                    seg[13] = UInt8(dpi & 0xFF)                        // Xdensity lo
+                    seg[14] = UInt8((dpi >> 8) & 0xFF)                 // Ydensity hi
+                    seg[15] = UInt8(dpi & 0xFF)                        // Ydensity lo
+                }
+                out.append(contentsOf: seg)
+                injectICCIfNeeded()                                     // ICC right after JFIF
+                i = end
+                continue
+            }
+            out.append(contentsOf: bytes[(j - 1)..<end])
+            i = end
+        }
+
+        do {
+            try Data(out).write(to: destination)
+            return true
+        } catch {
+            return false
+        }
     }
 }
 
@@ -179,6 +276,9 @@ public struct ExportSummary: Equatable {
     public var skipped = 0
     public var failed = 0
     public var cancelled = false
+    /// Total output units (files × formats) planned for this run, so the UI can
+    /// render "Cancelled n/total" after a cancel.
+    public var total = 0
 
     public init() {}
 
@@ -411,6 +511,7 @@ public final class ExportJob {
             case .webp: webpTotal += 1
             }
         }
+        let totalUnits = units.count
 
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = max(1, cpuLimit > 0 ? cpuLimit : ProcessInfo.processInfo.activeProcessorCount)
@@ -454,7 +555,9 @@ public final class ExportJob {
 
         group.notify(queue: .main) { [weak self] in
             self?.isRunning = false
-            completion(summary.snapshot)
+            var result = summary.snapshot
+            result.total = totalUnits
+            completion(result)
         }
     }
 

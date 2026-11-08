@@ -163,6 +163,15 @@ final class CanvasView: NSView {
     private var transformGestureStartPSDBox = PSDTextBox.defaults
     private var transformGestureStartExtra = OverlayTransform.identity
     private var transformGestureExtraID: UUID?
+    // Rotation pivot (element centre) captured at mouseDown.
+    private var transformGesturePivot: CGPoint = .zero
+    // Scale-gesture snapshot (canvas coordinates), recomputed from the
+    // mouseDown transforms every drag so the box never drifts or accumulates.
+    private var transformGestureStartCorners: [CGPoint] = []
+    private var transformGestureStartCenter: CGPoint = .zero
+    private var transformGestureHandleCenter: CGPoint = .zero
+    private var transformGestureGrabOffset: CGPoint = .zero
+    private var transformGestureRotation: Double = 0
 
     // Layer-2 box rubber-band drawing state (armed by the panel's Draw box).
     private var psdBoxDrawingEnabled = false
@@ -176,11 +185,67 @@ final class CanvasView: NSView {
     private static let padding: CGFloat = 28
     private static let minScale = 0.05
     private static let maxScale = 50.0
+    /// Free-transform resize scale limits (2% … 2000%), per the handle-drag spec.
+    private static let minResizeScale = 0.02
+    private static let maxResizeScale = 20.0
     private static let gestureIdleMs = 400
     private static let handleSize: CGFloat = 8
     private static let rotateHandleRadius: CGFloat = 7
     private static let rotateOffset: CGFloat = 22
     private static let hitThreshold: CGFloat = 8
+
+    // MARK: - Resize / rotate cursors
+
+    private enum CursorGlyph { case diagNWSE, diagNESW, rotate }
+
+    private static let diagNWSECursor: NSCursor = makeCursor(.diagNWSE)
+    private static let diagNESWCursor: NSCursor = makeCursor(.diagNESW)
+    private static let rotateCursor: NSCursor = makeCursor(.rotate)
+
+    /// Draw a small double-headed arrow cursor (black with a white halo so it
+    /// stays visible over dark canvas pixels).
+    private static func makeCursor(_ glyph: CursorGlyph) -> NSCursor {
+        let size = NSSize(width: 16, height: 16)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        if let ctx = NSGraphicsContext.current?.cgContext {
+            ctx.setLineCap(.round)
+            func stroke(_ pts: [CGPoint], _ color: NSColor, _ width: CGFloat) {
+                ctx.setStrokeColor(color.cgColor)
+                ctx.setLineWidth(width)
+                ctx.move(to: pts[0])
+                for p in pts.dropFirst() { ctx.addLine(to: p) }
+                ctx.strokePath()
+            }
+            func draw(_ pts: [CGPoint]) {
+                stroke(pts, .white, 2.4)
+                stroke(pts, .black, 1.0)
+            }
+            switch glyph {
+            case .diagNWSE: // backslash "\" — NW ⇄ SE
+                draw([CGPoint(x: 2.5, y: 13.5), CGPoint(x: 13.5, y: 2.5)])
+                draw([CGPoint(x: 2.5, y: 13.5), CGPoint(x: 7.5, y: 13.5)])
+                draw([CGPoint(x: 2.5, y: 13.5), CGPoint(x: 2.5, y: 8.5)])
+                draw([CGPoint(x: 13.5, y: 2.5), CGPoint(x: 8.5, y: 2.5)])
+                draw([CGPoint(x: 13.5, y: 2.5), CGPoint(x: 13.5, y: 7.5)])
+            case .diagNESW: // slash "/" — NE ⇄ SW
+                draw([CGPoint(x: 2.5, y: 2.5), CGPoint(x: 13.5, y: 13.5)])
+                draw([CGPoint(x: 2.5, y: 2.5), CGPoint(x: 7.5, y: 2.5)])
+                draw([CGPoint(x: 2.5, y: 2.5), CGPoint(x: 2.5, y: 7.5)])
+                draw([CGPoint(x: 13.5, y: 13.5), CGPoint(x: 8.5, y: 13.5)])
+                draw([CGPoint(x: 13.5, y: 13.5), CGPoint(x: 13.5, y: 8.5)])
+            case .rotate: // circular arrow
+                ctx.setStrokeColor(NSColor.black.cgColor)
+                ctx.setLineWidth(1.0)
+                ctx.addArc(center: CGPoint(x: 8, y: 8), radius: 5, startAngle: 0.4, endAngle: .pi * 1.75, clockwise: true)
+                ctx.strokePath()
+                draw([CGPoint(x: 12.8, y: 6.2), CGPoint(x: 12.8, y: 11.4)])
+                draw([CGPoint(x: 12.8, y: 11.4), CGPoint(x: 7.6, y: 11.4)])
+            }
+        }
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: NSPoint(x: 8, y: 8))
+    }
 
     // MARK: - Init
 
@@ -337,8 +402,8 @@ final class CanvasView: NSView {
         let ax = CGFloat(Double(compositePixelSize.width) * (1 - watermarkTransform.offsetFractionX))
         let ay = CGFloat(Double(compositePixelSize.height) * watermarkTransform.offsetFractionY)
         let rect = CGRect(x: -w, y: 0, width: w, height: h)
-        let t = CGAffineTransform(translationX: ax, y: ay)
-            .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermarkTransform.rotationDeg * .pi / 180)))
+        let t = CGAffineTransform(rotationAngle: CGFloat(watermarkTransform.rotationDeg * .pi / 180))
+            .concatenating(CGAffineTransform(translationX: ax, y: ay))
         return LayerGeometry.corners(of: rect, transform: t)
     }
 
@@ -601,10 +666,11 @@ final class CanvasView: NSView {
         isMouseOver = false
         hoveredLayer = nil
         updateGlow()
+        resetCursor()
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard !locked else { hoveredLayer = nil; return }
+        guard !locked else { hoveredLayer = nil; resetCursor(); return }
         let screenPoint = convert(event.locationInWindow, from: nil)
         if let psdBox = psdTextBox,
            quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
@@ -614,6 +680,34 @@ final class CanvasView: NSView {
         } else {
             hoveredLayer = nil
         }
+        updateCursor(at: screenPoint)
+    }
+
+    /// Set the resize/rotate cursor when hovering a selected element's handles.
+    private func updateCursor(at p: CGPoint) {
+        guard let sel = selection else { resetCursor(); return }
+        let quad = selectionScreenQuad()
+        guard quad.count == 4 else { resetCursor(); return }
+        if sel != .psdText, hitRotateHandle(p, quad: quad) {
+            Self.rotateCursor.set()
+            return
+        }
+        if let handle = hitScaleHandle(p, quad: quad) {
+            switch scaleHandleKind(handle) {
+            case .corner:
+                // Corners 0/2 sit on the NW–SE diagonal, 1/3 on NE–SW.
+                let diag = (handle == 0 || handle == 2) ? Self.diagNWSECursor : Self.diagNESWCursor
+                diag.set()
+            case .edgeX: NSCursor.resizeLeftRight.set()
+            case .edgeY: NSCursor.resizeUpDown.set()
+            }
+            return
+        }
+        resetCursor()
+    }
+
+    private func resetCursor() {
+        NSCursor.arrow.set()
     }
 
     /// Middle-click (button 2) opens the hovered layer element in Photoshop.
@@ -751,6 +845,8 @@ final class CanvasView: NSView {
         }
 
         if let layer = transformGestureLayer {
+            // Shift toggles uniform ↔ single-axis live during the gesture.
+            transformGestureShift = event.modifierFlags.contains(.shift)
             applyTransformDrag(layer, canvas: canvas, commit: false)
             return
         }
@@ -809,7 +905,30 @@ final class CanvasView: NSView {
             transformGestureExtraID = id
             transformGestureStartExtra = extraLayerState(id)?.transform ?? .identity
         }
-        transformGestureAnchor = scaleAnchor(for: layer)
+
+        // Snapshot the selected element's geometry from the mouseDown transforms
+        // so every drag recomputes from a fixed frame (no drift, correct under
+        // any rotation).
+        let corners = snapshotCorners(for: layer)
+        transformGestureStartCorners = corners
+        transformGestureRotation = snapshotRotationDeg(for: layer)
+        transformGesturePivot = Self.centroid(corners)
+        transformGestureStartCenter = transformGesturePivot
+        transformGestureHandleCenter = transformGesturePivot
+        transformGestureGrabOffset = .zero
+        transformGestureAnchor = transformGesturePivot
+
+        if mode == .scale, corners.count == 4, let handle = scaleHandle {
+            let handles = scaleHandles(in: corners)
+            guard handle >= 0, handle < handles.count else { beginGesture(); return }
+            let handleCenter = handles[handle]
+            transformGestureHandleCenter = handleCenter
+            transformGestureGrabOffset = CGPoint(x: start.x - handleCenter.x, y: start.y - handleCenter.y)
+            // Opposite anchor: corner for a corner handle, edge midpoint for an
+            // edge handle. This stays fixed while the dragged handle lands on
+            // the cursor target.
+            transformGestureAnchor = Self.oppositeScaleAnchor(handle: handle, in: handles)
+        }
         beginGesture()
     }
 
@@ -819,6 +938,8 @@ final class CanvasView: NSView {
         transformGestureShift = false
         transformGestureScaleHandle = nil
         transformGestureExtraID = nil
+        transformGestureStartCorners = []
+        transformGestureGrabOffset = .zero
     }
 
     /// Whether the given scale handle is a corner or an edge midpoint.
@@ -832,44 +953,120 @@ final class CanvasView: NSView {
         }
     }
 
-    /// Fixed pivot for the current transform gesture, computed from the
-    /// transforms captured at drag start (never from the live, drifting box).
-    private func scaleAnchor(for layer: SelectedLayer) -> CGPoint {
+    private static func centroid(_ points: [CGPoint]) -> CGPoint {
+        guard !points.isEmpty else { return .zero }
+        var x: CGFloat = 0, y: CGFloat = 0
+        for p in points { x += p.x; y += p.y }
+        let n = CGFloat(points.count)
+        return CGPoint(x: x / n, y: y / n)
+    }
+
+    /// The fixed point opposite the dragged handle (corner → opposite corner,
+    /// edge midpoint → opposite edge midpoint).
+    private static func oppositeScaleAnchor(handle: Int, in handles: [CGPoint]) -> CGPoint {
+        let opposite: Int
+        if handle < 4 {
+            opposite = (handle + 2) % 4
+        } else {
+            opposite = 4 + ((handle - 4 + 2) % 4)
+        }
+        return handles.indices.contains(opposite) ? handles[opposite] : .zero
+    }
+
+    /// The selected element's four corners at mouseDown, computed from the
+    /// snapshot transforms (not the live, drifting ones).
+    private func snapshotCorners(for layer: SelectedLayer) -> [CGPoint] {
         switch layer {
         case .overlay:
-            let base = overlayBaseSize ?? .zero
-            let s = canvasOffsetScale()
-            let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
-            let t = LayerGeometry.centeredTransform(
-                canvas: compositePixelSize,
-                offsetX: transformGestureStartOverlay.offsetX * s,
-                offsetY: transformGestureStartOverlay.offsetY * s,
-                scaleX: transformGestureStartOverlay.scaleX,
-                scaleY: transformGestureStartOverlay.scaleY,
-                rotationDeg: transformGestureStartOverlay.rotationDeg
-            )
-            return LayerGeometry.boundingBox(of: local, transform: t).center
+            guard let base = overlayBaseSize, base.width > 0, base.height > 0 else { return [] }
+            let s = Double(canvasOffsetScale())
+            let t = transformGestureStartOverlay
+            return LayerGeometry.centeredCorners(
+                canvas: compositePixelSize, baseSize: base,
+                offsetX: t.offsetX * s, offsetY: t.offsetY * s,
+                scaleX: t.scaleX, scaleY: t.scaleY, rotationDeg: t.rotationDeg)
         case .watermark:
-            return CGPoint(
-                x: CGFloat(Double(compositePixelSize.width) * (1 - transformGestureStartWatermark.offsetFractionX)),
-                y: CGFloat(Double(compositePixelSize.height) * transformGestureStartWatermark.offsetFractionY)
-            )
+            guard let base = watermarkBaseSize, base.width > 0, base.height > 0 else { return [] }
+            let t = transformGestureStartWatermark
+            let w = base.width * CGFloat(t.scaleX)
+            let h = base.height * CGFloat(t.scaleY)
+            let ax = CGFloat(Double(compositePixelSize.width) * (1 - t.offsetFractionX))
+            let ay = CGFloat(Double(compositePixelSize.height) * t.offsetFractionY)
+            let rect = CGRect(x: -w, y: 0, width: w, height: h)
+            let tr = CGAffineTransform(rotationAngle: CGFloat(t.rotationDeg * .pi / 180))
+                .concatenating(CGAffineTransform(translationX: ax, y: ay))
+            return LayerGeometry.corners(of: rect, transform: tr)
         case .psdText:
-            return transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize).center
+            return rectCorners(transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize))
         case .extraLayer(let id):
-            let base = extraLayerState(id)?.baseSize ?? .zero
-            let s = canvasOffsetScale()
-            let local = CGRect(x: -base.width / 2, y: -base.height / 2, width: base.width, height: base.height)
-            let t = LayerGeometry.centeredTransform(
-                canvas: compositePixelSize,
-                offsetX: transformGestureStartExtra.offsetX * s,
-                offsetY: transformGestureStartExtra.offsetY * s,
-                scaleX: transformGestureStartExtra.scaleX,
-                scaleY: transformGestureStartExtra.scaleY,
-                rotationDeg: transformGestureStartExtra.rotationDeg
-            )
-            return LayerGeometry.boundingBox(of: local, transform: t).center
+            guard let base = extraLayerState(id)?.baseSize, base.width > 0, base.height > 0 else { return [] }
+            let s = Double(canvasOffsetScale())
+            let t = transformGestureStartExtra
+            return LayerGeometry.centeredCorners(
+                canvas: compositePixelSize, baseSize: base,
+                offsetX: t.offsetX * s, offsetY: t.offsetY * s,
+                scaleX: t.scaleX, scaleY: t.scaleY, rotationDeg: t.rotationDeg)
         }
+    }
+
+    private func snapshotRotationDeg(for layer: SelectedLayer) -> Double {
+        switch layer {
+        case .overlay: return transformGestureStartOverlay.rotationDeg
+        case .watermark: return transformGestureStartWatermark.rotationDeg
+        case .psdText: return 0
+        case .extraLayer: return transformGestureStartExtra.rotationDeg
+        }
+    }
+
+    /// The point the dragged handle centre should land on, after removing the
+    /// grab offset captured at mouseDown (so the cursor never slips off the
+    /// handle).
+    private func transformTarget(canvas: CGPoint) -> CGPoint {
+        CGPoint(x: canvas.x - transformGestureGrabOffset.x, y: canvas.y - transformGestureGrabOffset.y)
+    }
+
+    /// Relative scale factors (x, y) that place the dragged handle exactly on
+    /// `target` while the fixed anchor stays put, measured in the element's
+    /// rotated frame. Corners project onto the original diagonal (uniform);
+    /// edge handles stretch one axis unless Shift is held (uniform).
+    private func scaleFactors(target: CGPoint) -> (x: Double, y: Double) {
+        let anchor = transformGestureAnchor
+        let handle = transformGestureHandleCenter
+        let rad = transformGestureRotation * .pi / 180
+        let d = rotateVector(CGPoint(x: handle.x - anchor.x, y: handle.y - anchor.y), -rad)
+        let u = rotateVector(CGPoint(x: target.x - anchor.x, y: target.y - anchor.y), -rad)
+        let denom = Double(d.x * d.x + d.y * d.y)
+        let uniformF = denom > 1e-12 ? Double(u.x * d.x + u.y * d.y) / denom : 1
+        switch transformGestureScaleHandle.map(scaleHandleKind) ?? .corner {
+        case .corner:
+            return (uniformF, uniformF)
+        case .edgeX:
+            if transformGestureShift { return (uniformF, uniformF) }
+            guard abs(Double(d.x)) > 1e-12 else { return (1, 1) }
+            return (Double(u.x) / Double(d.x), 1)
+        case .edgeY:
+            if transformGestureShift { return (uniformF, uniformF) }
+            guard abs(Double(d.y)) > 1e-12 else { return (1, 1) }
+            return (1, Double(u.y) / Double(d.y))
+        }
+    }
+
+    /// Rotate a canvas vector by `radians` (same convention as
+    /// `CGAffineTransform(rotationAngle:)`).
+    private func rotateVector(_ v: CGPoint, _ radians: Double) -> CGPoint {
+        v.applying(CGAffineTransform(rotationAngle: CGFloat(radians)))
+    }
+
+    /// Map a canvas point through the scale-about-anchor transform: rotate into
+    /// the element frame, scale x/y, rotate back. The anchor is the fixed point.
+    private func scaledPoint(_ p: CGPoint, fx: Double, fy: Double) -> CGPoint {
+        let anchor = transformGestureAnchor
+        let rad = transformGestureRotation * .pi / 180
+        let v = CGPoint(x: p.x - anchor.x, y: p.y - anchor.y)
+        let vRot = rotateVector(v, -rad)
+        let vNew = CGPoint(x: vRot.x * CGFloat(fx), y: vRot.y * CGFloat(fy))
+        let vOut = rotateVector(vNew, rad)
+        return CGPoint(x: anchor.x + vOut.x, y: anchor.y + vOut.y)
     }
 
     private func applyTransformDrag(_ layer: SelectedLayer, canvas: CGPoint, commit: Bool) {
@@ -885,10 +1082,7 @@ final class CanvasView: NSView {
                 t.offsetX += dx / s
                 t.offsetY += dy / s
             case .scale:
-                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
-                    t.scaleX = clampScale(t.scaleX * fx)
-                    t.scaleY = clampScale(t.scaleY * fy)
-                }
+                applyScale(to: &t, transform: transformGestureStartOverlay, canvasScale: Double(canvasOffsetScale()), target: transformTarget(canvas: canvas))
             case .rotate:
                 t.rotationDeg += rotateDelta(canvas: canvas)
             }
@@ -902,10 +1096,23 @@ final class CanvasView: NSView {
                 t.offsetFractionX -= dx / Double(compositePixelSize.width)
                 t.offsetFractionY += dy / Double(compositePixelSize.height)
             case .scale:
-                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
-                    t.scaleX = clampScale(t.scaleX * fx)
-                    t.scaleY = clampScale(t.scaleY * fy)
-                }
+                let target = transformTarget(canvas: canvas)
+                let f = scaleFactors(target: target)
+                let startSX = transformGestureStartWatermark.scaleX
+                let startSY = transformGestureStartWatermark.scaleY
+                let newSX = clampScale(startSX * f.x)
+                let newSY = clampScale(startSY * f.y)
+                t.scaleX = newSX
+                t.scaleY = newSY
+                let effFX = startSX > 0 ? newSX / startSX : 1
+                let effFY = startSY > 0 ? newSY / startSY : 1
+                let cw = Double(compositePixelSize.width)
+                let ch = Double(compositePixelSize.height)
+                // Watermark origin = local bottom-right corner (index 1); move
+                // it so the fixed anchor stays put.
+                let newOrigin = scaledPoint(transformGestureStartCorners[1], fx: effFX, fy: effFY)
+                t.offsetFractionX = 1 - Double(newOrigin.x) / cw
+                t.offsetFractionY = Double(newOrigin.y) / ch
             case .rotate:
                 t.rotationDeg += rotateDelta(canvas: canvas)
             }
@@ -921,22 +1128,25 @@ final class CanvasView: NSView {
                 b.x += dx / cw
                 b.y -= dy / ch
             case .scale:
-                let startRect = transformGestureStartPSDBox.pixelRect(canvas: compositePixelSize)
-                let center = startRect.center
-                let startDist = max(1, hypot(Double(transformGestureStart.x - center.x), Double(transformGestureStart.y - center.y)))
-                let nowDist = hypot(Double(canvas.x - center.x), Double(canvas.y - center.y))
-                let f = min(Self.maxScale, max(Self.minScale, nowDist / startDist))
-                let cx = b.x + b.width / 2
-                let cy = b.y + b.height / 2
-                b.width = max(0.01, min(1, b.width * f))
-                b.height = max(0.01, min(1, b.height * f))
-                b.x = max(0, min(1 - b.width, cx - b.width / 2))
-                b.y = max(0, min(1 - b.height, cy - b.height / 2))
+                let target = transformTarget(canvas: canvas)
+                let f = scaleFactors(target: target)
+                let startW = transformGestureStartPSDBox.width
+                let startH = transformGestureStartPSDBox.height
+                let newW = max(0.001, min(1.0, startW * f.x))
+                let newH = max(0.001, min(1.0, startH * f.y))
+                let effFX = startW > 0 ? newW / startW : 1
+                let effFY = startH > 0 ? newH / startH : 1
+                let newBL = scaledPoint(transformGestureStartCorners[0], fx: effFX, fy: effFY)
+                b.x = Double(newBL.x) / cw
+                b.y = 1 - newH - Double(newBL.y) / ch
+                b.width = newW
+                b.height = newH
+                b = b.clamped()
             case .rotate:
                 break
             }
-            psdTextBox = b.clamped()
-            onPSDTextBoxChanged?(psdTextBox ?? .defaults, commit, transformGestureOption)
+            psdTextBox = b
+            onPSDTextBoxChanged?(b, commit, transformGestureOption)
 
         case .extraLayer(let id):
             var t = transformGestureStartExtra
@@ -946,10 +1156,7 @@ final class CanvasView: NSView {
                 t.offsetX += dx / s
                 t.offsetY += dy / s
             case .scale:
-                applyScaleDrag(x: canvas.x, y: canvas.y) { fx, fy in
-                    t.scaleX = clampScale(t.scaleX * fx)
-                    t.scaleY = clampScale(t.scaleY * fy)
-                }
+                applyScale(to: &t, transform: transformGestureStartExtra, canvasScale: Double(canvasOffsetScale()), target: transformTarget(canvas: canvas))
             case .rotate:
                 t.rotationDeg += rotateDelta(canvas: canvas)
             }
@@ -959,43 +1166,40 @@ final class CanvasView: NSView {
         updateSelectionLayer()
     }
 
+    /// Apply a scale gesture to a centred `OverlayTransform` (overlay / extra
+    /// layer): scale both axes from the snapshot, then move the centre so the
+    /// fixed anchor corner stays put.
+    private func applyScale(to t: inout OverlayTransform, transform start: OverlayTransform,
+                            canvasScale s: Double, target: CGPoint) {
+        let f = scaleFactors(target: target)
+        let startSX = start.scaleX
+        let startSY = start.scaleY
+        let newSX = clampScale(startSX * f.x)
+        let newSY = clampScale(startSY * f.y)
+        t.scaleX = newSX
+        t.scaleY = newSY
+        let effFX = startSX > 0 ? newSX / startSX : 1
+        let effFY = startSY > 0 ? newSY / startSY : 1
+        let newCenter = scaledPoint(transformGestureStartCenter, fx: effFX, fy: effFY)
+        let cw = Double(compositePixelSize.width)
+        let ch = Double(compositePixelSize.height)
+        t.offsetX = (Double(newCenter.x) - cw / 2) / s
+        t.offsetY = (Double(newCenter.y) - ch / 2) / s
+    }
+
     private func updateExtraLayerTransform(id: UUID, transform: OverlayTransform) {
         guard let idx = extraLayerStates.firstIndex(where: { $0.id == id }) else { return }
         extraLayerStates[idx].transform = transform
     }
 
     private func clampScale(_ v: Double) -> Double {
-        min(Self.maxScale, max(Self.minScale, v))
-    }
-
-    /// Compute scale factors (x, y) from the fixed gesture anchor and the
-    /// dragged handle. Corners (and Shift) scale uniformly; edge/mid handles
-    /// stretch a single axis unless Shift is held.
-    private func applyScaleDrag(x: CGFloat, y: CGFloat, _ mutate: (Double, Double) -> Void) {
-        let anchor = transformGestureAnchor
-        let startX = Double(transformGestureStart.x - anchor.x)
-        let startY = Double(transformGestureStart.y - anchor.y)
-        let nowX = Double(x - anchor.x)
-        let nowY = Double(y - anchor.y)
-        let kind = transformGestureScaleHandle.map(scaleHandleKind) ?? .corner
-        if transformGestureShift || kind == .corner {
-            let startDist = max(1, hypot(startX, startY))
-            let nowDist = hypot(nowX, nowY)
-            let f = nowDist / startDist
-            mutate(f, f)
-        } else if kind == .edgeX {
-            guard abs(startX) > 0.0001 else { return }
-            mutate(nowX / startX, 1)
-        } else {
-            guard abs(startY) > 0.0001 else { return }
-            mutate(1, nowY / startY)
-        }
+        min(Self.maxResizeScale, max(Self.minResizeScale, v))
     }
 
     private func rotateDelta(canvas: CGPoint) -> Double {
-        let anchor = transformGestureAnchor
-        let startAngle = atan2(Double(transformGestureStart.y - anchor.y), Double(transformGestureStart.x - anchor.x))
-        let nowAngle = atan2(Double(canvas.y - anchor.y), Double(canvas.x - anchor.x))
+        let pivot = transformGesturePivot
+        let startAngle = atan2(Double(transformGestureStart.y - pivot.y), Double(transformGestureStart.x - pivot.x))
+        let nowAngle = atan2(Double(canvas.y - pivot.y), Double(canvas.x - pivot.x))
         return (nowAngle - startAngle) * 180 / .pi
     }
 

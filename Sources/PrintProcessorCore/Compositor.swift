@@ -60,10 +60,13 @@ public enum LayerGeometry {
         scaleY: Double,
         rotationDeg: Double
     ) -> CGAffineTransform {
-        var t = CGAffineTransform(translationX: canvas.width / 2, y: canvas.height / 2)
-        t = t.concatenating(CGAffineTransform(translationX: CGFloat(offsetX), y: CGFloat(offsetY)))
+        // scale → rotate → offset → canvas-centre. This matches the compositor's
+        // CGContext order (translate(canvas/2), translate(offset), rotate, scale),
+        // where the last call is applied to the point first.
+        var t = CGAffineTransform(scaleX: CGFloat(scaleX), y: CGFloat(scaleY))
         t = t.concatenating(CGAffineTransform(rotationAngle: CGFloat(rotationDeg * .pi / 180)))
-        t = t.concatenating(CGAffineTransform(scaleX: CGFloat(scaleX), y: CGFloat(scaleY)))
+        t = t.concatenating(CGAffineTransform(translationX: CGFloat(offsetX), y: CGFloat(offsetY)))
+        t = t.concatenating(CGAffineTransform(translationX: canvas.width / 2, y: canvas.height / 2))
         return t
     }
 
@@ -147,8 +150,8 @@ public enum LayerGeometry {
         let ax = canvas.width * (1 - CGFloat(watermark.transform.offsetFractionX))
         let ay = canvas.height * CGFloat(watermark.transform.offsetFractionY)
         let rect = CGRect(x: -w, y: 0, width: w, height: h)
-        let t = CGAffineTransform(translationX: ax, y: ay)
-            .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermark.transform.rotationDeg * .pi / 180)))
+        let t = CGAffineTransform(rotationAngle: CGFloat(watermark.transform.rotationDeg * .pi / 180))
+            .concatenating(CGAffineTransform(translationX: ax, y: ay))
         return corners(of: rect, transform: t)
     }
 
@@ -225,8 +228,8 @@ public enum LayerGeometry {
         let ax = CGFloat(Double(canvas.width) * (1 - watermark.transform.offsetFractionX))
         let ay = CGFloat(Double(canvas.height) * watermark.transform.offsetFractionY)
         let rect = CGRect(x: -width, y: 0, width: width, height: height)
-        let t = CGAffineTransform(translationX: ax, y: ay)
-            .concatenating(CGAffineTransform(rotationAngle: CGFloat(watermark.transform.rotationDeg * .pi / 180)))
+        let t = CGAffineTransform(rotationAngle: CGFloat(watermark.transform.rotationDeg * .pi / 180))
+            .concatenating(CGAffineTransform(translationX: ax, y: ay))
         return boundingBox(of: rect, transform: t)
     }
 

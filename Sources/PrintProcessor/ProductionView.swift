@@ -101,6 +101,8 @@ final class ProductionView: NSView, NSTextViewDelegate {
     private var noExport: Set<String> = []
     private var previewFull = false
     private var noExportButton: NSButton?
+    private var fileJumpPopup: NSPopUpButton?
+    private var fileJumpSignature = ""
     private var previewFullButton: NSButton?
 
     // Interactive low-res preview: static layers cached, photo transformed per frame.
@@ -280,7 +282,16 @@ final class ProductionView: NSView, NSTextViewDelegate {
         resetAllButton.bezelStyle = .rounded
         resetAllButton.controlSize = .regular
         resetAllButton.toolTip = "Reset all files — put every photo (layer 4) back to Fit. Asks to confirm."
-        let controlsRow = NSStackView(views: [sizeStack, previewFullButton, resetThisButton, resetAllButton, processButton, cancelButton])
+        let fileJump = NSPopUpButton(frame: .zero, pullsDown: false)
+        fileJump.controlSize = .regular
+        fileJump.target = self
+        fileJump.action = #selector(fileJumpChanged(_:))
+        fileJump.toolTip = "Jump to file — choose any file in the list to open it. Files marked ✕ are NO EXPORT."
+        fileJump.translatesAutoresizingMaskIntoConstraints = false
+        fileJump.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        fileJump.isEnabled = false
+        self.fileJumpPopup = fileJump
+        let controlsRow = NSStackView(views: [sizeStack, previewFullButton, resetThisButton, resetAllButton, fileJump, processButton, cancelButton])
         controlsRow.orientation = .horizontal
         controlsRow.alignment = .centerY
         controlsRow.spacing = 10
@@ -2779,7 +2790,32 @@ final class ProductionView: NSView, NSTextViewDelegate {
 
     // MARK: - Status
 
+    private func refreshFileJump() {
+        guard let popup = fileJumpPopup else { return }
+        let signature = "\(files.count)|\(files.first?.lastPathComponent ?? "")|\(files.last?.lastPathComponent ?? "")|\(noExport.count)|\(noExport.sorted().joined(separator: ","))"
+        if signature != fileJumpSignature {
+            fileJumpSignature = signature
+            popup.removeAllItems()
+            for (i, url) in files.enumerated() {
+                let name = url.lastPathComponent
+                popup.addItem(withTitle: "\(i + 1). \(noExport.contains(name) ? "✕ " : "")\(name)")
+            }
+        }
+        popup.isEnabled = !files.isEmpty
+        if files.indices.contains(currentIndex), popup.numberOfItems == files.count {
+            popup.selectItem(at: currentIndex)
+        }
+    }
+
+    @objc private func fileJumpChanged(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard index >= 0, index != currentIndex else { return }
+        goTo(index: index)
+        window?.makeFirstResponder(canvasView)
+    }
+
     private func updateStatus() {
+        refreshFileJump()
         if files.isEmpty {
             statusLabel.textColor = .dimText
             if let size = selectedSize {

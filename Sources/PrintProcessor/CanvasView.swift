@@ -1246,10 +1246,18 @@ final class CanvasView: NSView {
         }
     }
 
+    /// macOS swaps the wheel to the X axis while Shift is held, so Shift and
+    /// Cmd+Shift scrolls would read deltaY == 0. Use whichever axis is larger.
+    static func wheelDelta(_ event: NSEvent) -> Double {
+        let y = Double(event.scrollingDeltaY)
+        let x = Double(event.scrollingDeltaX)
+        return abs(x) > abs(y) ? x : y
+    }
+
     private func zoom(with event: NSEvent) {
         var e = edit
         let speed = max(0.0, settings.scrollZoomSpeed)
-        let delta = Double(event.scrollingDeltaY)
+        let delta = Self.wheelDelta(event)
         let factor: Double
         if event.hasPreciseScrollingDeltas {
             factor = exp(delta * 0.008 * speed)
@@ -1266,7 +1274,7 @@ final class CanvasView: NSView {
         let step = max(0.01, min(1.5, settings.rotateStep))
         let speed = max(0.0, settings.scrollRotateSpeed)
         if event.hasPreciseScrollingDeltas {
-            preciseRotateAccum += Double(event.scrollingDeltaY)
+            preciseRotateAccum += Self.wheelDelta(event)
             let whole = (preciseRotateAccum / 30.0).rounded(.towardZero)
             if whole != 0 {
                 e.rotationDeg += whole * step * speed
@@ -1274,7 +1282,8 @@ final class CanvasView: NSView {
                 applyEdit(e, commit: true, scope: lastGestureScope)
             }
         } else {
-            let direction: Double = event.scrollingDeltaY > 0 ? 1 : (event.scrollingDeltaY < 0 ? -1 : 0)
+            let wd = Self.wheelDelta(event)
+            let direction: Double = wd > 0 ? 1 : (wd < 0 ? -1 : 0)
             if direction != 0 {
                 e.rotationDeg += direction * step * speed
                 applyEdit(e, commit: true, scope: lastGestureScope)

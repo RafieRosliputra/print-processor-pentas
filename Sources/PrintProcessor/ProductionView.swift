@@ -272,7 +272,15 @@ final class ProductionView: NSView, NSTextViewDelegate {
         cancelButton.isHidden = true
         self.cancelButton = cancelButton
 
-        let controlsRow = NSStackView(views: [sizeStack, previewFullButton, processButton, cancelButton])
+        let resetThisButton = NSButton(title: "Reset 1 file", target: self, action: #selector(resetThisClicked))
+        resetThisButton.bezelStyle = .rounded
+        resetThisButton.controlSize = .regular
+        resetThisButton.toolTip = "Reset 1 file — put this photo (layer 4) back to Fit: zoom, position and rotation."
+        let resetAllButton = NSButton(title: "Reset all files", target: self, action: #selector(resetAllClicked))
+        resetAllButton.bezelStyle = .rounded
+        resetAllButton.controlSize = .regular
+        resetAllButton.toolTip = "Reset all files — put every photo (layer 4) back to Fit. Asks to confirm."
+        let controlsRow = NSStackView(views: [sizeStack, previewFullButton, resetThisButton, resetAllButton, processButton, cancelButton])
         controlsRow.orientation = .horizontal
         controlsRow.alignment = .centerY
         controlsRow.spacing = 10
@@ -2685,6 +2693,36 @@ final class ProductionView: NSView, NSTextViewDelegate {
             }
             gestureBaseline = nil
         }
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func resetThisClicked() {
+        guard let key = currentKey() else { return }
+        let old = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
+        pushUndo(fileName: key.fileName, value: old)
+        edits.setEdit(.identity, sizeKey: key.sizeKey, fileName: key.fileName)
+        lastEdit = .identity
+        canvasView.edit = .identity
+        scheduleRenderPreview()
+        scheduleAutosave()
+    }
+
+    @objc private func resetAllClicked() {
+        guard let key = currentKey() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Reset all files to Fit?"
+        alert.informativeText = "Zoom, position and rotation of every photo (this paper size) go back to Fit. Undo only restores the current photo."
+        alert.addButton(withTitle: "Reset all")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let old = edits.edit(sizeKey: key.sizeKey, fileName: key.fileName) ?? .identity
+        pushUndo(fileName: key.fileName, value: old)
+        edits.setEdit(.identity, sizeKey: key.sizeKey, fileName: key.fileName)
+        edits.applyGlobalEdit(.identity, scope: .all, sizeKey: key.sizeKey,
+                              files: files.map { $0.lastPathComponent }, currentIndex: currentIndex)
+        lastEdit = .identity
+        canvasView.edit = .identity
         scheduleRenderPreview()
         scheduleAutosave()
     }

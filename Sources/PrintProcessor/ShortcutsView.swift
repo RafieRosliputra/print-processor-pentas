@@ -93,7 +93,9 @@ final class ShortcutsView: NSView {
         rowsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
         for entry in store.entries {
-            rowsStack.addArrangedSubview(makeRow(entry))
+            let row = makeRow(entry)
+            rowsStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         }
         updateConflicts()
     }
@@ -134,7 +136,6 @@ final class ShortcutsView: NSView {
         row.layer?.borderWidth = 0.5
 
         function.widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
-        row.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         return row
     }
 

@@ -18,8 +18,10 @@ final class ExtraLayerRowView: NSView {
     var onReplaceFile: (() -> Void)?
     var onOpenInPhotoshop: (() -> Void)?
     var onSelect: (() -> Void)?
+    var onToggleLocked: ((Bool) -> Void)?
 
     private let eyeButton = NSButton()
+    private let lockButton = NSButton()
     private let nameButton = NSButton()
     private let opacitySlider = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let opacityValue = makeLabel("100%", size: 11, weight: .regular, color: .dimText)
@@ -32,6 +34,7 @@ final class ExtraLayerRowView: NSView {
     private let photoshopButton = NSButton()
 
     private var isEnabled = true
+    private var isLocked = false
 
     init(layerID: UUID) {
         self.layerID = layerID
@@ -44,9 +47,10 @@ final class ExtraLayerRowView: NSView {
     }
 
     /// Fill the row from a layer and the current reorder capabilities.
-    func configure(with layer: ExtraLayer, canMoveUp: Bool, canMoveDown: Bool, isSelected: Bool) {
+    func configure(with layer: ExtraLayer, canMoveUp: Bool, canMoveDown: Bool, isSelected: Bool, isLocked: Bool) {
         isEnabled = layer.enabled
         updateEyeIcon(enabled: layer.enabled)
+        updateLockIcon(locked: isLocked)
         nameButton.title = layer.name.isEmpty ? URL(fileURLWithPath: layer.path).lastPathComponent : layer.name
         opacitySlider.doubleValue = layer.opacity
         opacityValue.stringValue = Self.percent(layer.opacity)
@@ -57,6 +61,7 @@ final class ExtraLayerRowView: NSView {
         moveUpButton.isEnabled = canMoveUp
         moveDownButton.isEnabled = canMoveDown
         photoshopButton.isHidden = !layer.isPSD
+        setEditControlsEnabled(!isLocked)
         setSelected(isSelected)
     }
 
@@ -80,6 +85,14 @@ final class ExtraLayerRowView: NSView {
         eyeButton.target = self
         eyeButton.action = #selector(eyeToggled)
         eyeButton.toolTip = "Show/hide this layer"
+
+        lockButton.setButtonType(.momentaryChange)
+        lockButton.isBordered = false
+        lockButton.imagePosition = .imageOnly
+        lockButton.imageScaling = .scaleProportionallyDown
+        lockButton.target = self
+        lockButton.action = #selector(lockToggled)
+        lockButton.toolTip = "Lock/unlock this layer (locked layers can't be selected)"
 
         nameButton.title = ""
         nameButton.isBordered = false
@@ -137,12 +150,14 @@ final class ExtraLayerRowView: NSView {
         photoshopButton.action = #selector(openPSDClicked)
         photoshopButton.toolTip = "Open in Photoshop — open this layer's PSD source"
 
-        let header = NSStackView(views: [eyeButton, nameButton, moveUpButton, moveDownButton, deleteButton])
+        let header = NSStackView(views: [eyeButton, lockButton, nameButton, moveUpButton, moveDownButton, deleteButton])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 4
         eyeButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
         eyeButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        lockButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        lockButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
         moveUpButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
         moveDownButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
         deleteButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
@@ -184,6 +199,24 @@ final class ExtraLayerRowView: NSView {
         nameButton.alphaValue = enabled ? 1.0 : 0.45
     }
 
+    private func updateLockIcon(locked: Bool) {
+        isLocked = locked
+        lockButton.image = symbol(locked ? "lock.fill" : "lock.open")
+        lockButton.toolTip = locked
+            ? "Locked (click to unlock) — can't be selected on the canvas"
+            : "Unlocked (click to lock) — locked layers can't be selected"
+    }
+
+    /// Disable the layer's edit controls while it is locked.
+    private func setEditControlsEnabled(_ enabled: Bool) {
+        opacitySlider.isEnabled = enabled
+        blendPopup.isEnabled = enabled
+        clipCheckbox.isEnabled = enabled
+        replaceButton.isEnabled = enabled
+        photoshopButton.isEnabled = enabled
+        opacityValue.alphaValue = enabled ? 1.0 : 0.45
+    }
+
     private static func percent(_ v: Double) -> String {
         "\(Int((v * 100).rounded()))%"
     }
@@ -194,6 +227,13 @@ final class ExtraLayerRowView: NSView {
         isEnabled.toggle()
         updateEyeIcon(enabled: isEnabled)
         onToggleEnabled?(isEnabled)
+    }
+
+    @objc private func lockToggled() {
+        let locked = !isLocked
+        updateLockIcon(locked: locked)
+        setEditControlsEnabled(!locked)
+        onToggleLocked?(locked)
     }
 
     @objc private func opacityChanged() {

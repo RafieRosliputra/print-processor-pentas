@@ -448,11 +448,11 @@ final class ProductionView: NSView, NSTextViewDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let exportSection = SectionView(title: "Export", body: makeExportBody())
+        let exportSection = SectionView(title: "Export", body: makeExportBody(), showsLock: false)
         let watermarkSection = SectionView(title: "Watermark", body: makeWatermarkBody())
         let psdSection = SectionView(title: "PSD Text", body: makePSDTextBody())
         let overlaySection = SectionView(title: "Overlay", body: makeOverlayBody())
-        let gradientSection = SectionView(title: "Gradient", body: makeExtraLayersBody())
+        let gradientSection = SectionView(title: "Gradient", body: makeExtraLayersBody(), showsLock: false)
         let photoSection = SectionView(title: "Photo", body: makePhotoSectionBody())
         let bg5Section = SectionView(title: "Background", body: makeBackgroundBody())
         let bg6Section = SectionView(title: "Final Background", body: makeFinalBackgroundBody())
@@ -463,6 +463,13 @@ final class ProductionView: NSView, NSTextViewDelegate {
         photoSection.onEyeToggle = { [weak self] on in self?.setLayerEnabled(4, on) }
         bg5Section.onEyeToggle = { [weak self] on in self?.setLayerEnabled(5, on) }
         bg6Section.onEyeToggle = { [weak self] on in self?.setLayerEnabled(6, on) }
+
+        watermarkSection.onLockToggle = { [weak self] locked in self?.setLayerLocked(1, locked) }
+        psdSection.onLockToggle = { [weak self] locked in self?.setLayerLocked(2, locked) }
+        overlaySection.onLockToggle = { [weak self] locked in self?.setLayerLocked(3, locked) }
+        photoSection.onLockToggle = { [weak self] locked in self?.setLayerLocked(4, locked) }
+        bg5Section.onLockToggle = { [weak self] locked in self?.setLayerLocked(5, locked) }
+        bg6Section.onLockToggle = { [weak self] locked in self?.setLayerLocked(6, locked) }
 
         sections = [1: watermarkSection, 2: psdSection, 3: overlaySection,
                     4: photoSection, 5: bg5Section, 6: bg6Section]
@@ -904,8 +911,10 @@ final class ProductionView: NSView, NSTextViewDelegate {
         for (i, layer) in layers.enumerated() {
             let row = ExtraLayerRowView(layerID: layer.id)
             row.configure(with: layer, canMoveUp: i > 0, canMoveDown: i < layers.count - 1,
-                          isSelected: layer.id == selectedExtraLayerID)
+                          isSelected: layer.id == selectedExtraLayerID,
+                          isLocked: layerSettings.lockedExtraLayerIDs.contains(layer.id))
             row.onToggleEnabled = { [weak self] enabled in self?.setExtraLayer(layer.id) { $0.enabled = enabled } }
+            row.onToggleLocked = { [weak self] locked in self?.setExtraLayerLocked(layer.id, locked) }
             row.onOpacityChanged = { [weak self] value in self?.setExtraLayer(layer.id) { $0.opacity = min(1, max(0, value)) } }
             row.onBlendChanged = { [weak self] blend in self?.setExtraLayer(layer.id) { $0.blend = blend } }
             row.onClipChanged = { [weak self] clip in self?.setExtraLayer(layer.id) { $0.clipToPhoto = clip } }
@@ -925,6 +934,17 @@ final class ProductionView: NSView, NSTextViewDelegate {
         guard let idx = layerSettings.extraLayers.firstIndex(where: { $0.id == id }) else { return }
         mutate(&layerSettings.extraLayers[idx])
         afterExtraLayersChanged()
+    }
+
+    /// Lock/unlock one extra layer (prevents canvas selection + panel edits).
+    private func setExtraLayerLocked(_ id: UUID, _ locked: Bool) {
+        if locked {
+            layerSettings.lockedExtraLayerIDs.insert(id)
+        } else {
+            layerSettings.lockedExtraLayerIDs.remove(id)
+        }
+        pushLayerLocksToCanvas()
+        scheduleAutosave()
     }
 
     private func afterExtraLayersChanged() {
@@ -1257,10 +1277,38 @@ final class ProductionView: NSView, NSTextViewDelegate {
         scheduleAutosave()
     }
 
+    private func setLayerLocked(_ layer: Int, _ locked: Bool) {
+        layerSettings.locked[layer] = locked
+        pushLayerLocksToCanvas()
+        applyLayerLockToControls()
+        scheduleAutosave()
+    }
+
+    /// Push the layer lock state onto the canvas so locked layers can't be
+    /// selected or edited there.
+    private func pushLayerLocksToCanvas() {
+        var numbers = Set<Int>()
+        for layer in 1...6 where layerSettings.locked[layer] {
+            numbers.insert(layer)
+        }
+        canvasView.lockedLayerNumbers = numbers
+        canvasView.lockedExtraLayerIDs = layerSettings.lockedExtraLayerIDs
+    }
+
+    /// Disable panel controls for locked layers.
+    private func applyLayerLockToControls() {
+        for (key, section) in sections {
+            section.setBodyLocked(layerSettings.locked[key])
+        }
+    }
+
     private func applyLayerSettingsToUI() {
         for (key, section) in sections {
             section.setVisible(layerSettings.enabled[key])
+            section.setLocked(layerSettings.locked[key])
         }
+        pushLayerLocksToCanvas()
+        applyLayerLockToControls()
         syncControls()
     }
 

@@ -337,13 +337,65 @@ public struct LayerVisibility: Codable, Equatable {
     }
 }
 
+/// Lock flags for layers 1–6. A locked layer can't be selected or edited on the
+/// canvas (or via its panel controls).
+public struct LayerLock: Codable, Equatable {
+    public var layer1: Bool
+    public var layer2: Bool
+    public var layer3: Bool
+    public var layer4: Bool
+    public var layer5: Bool
+    public var layer6: Bool
+
+    public init(layer1: Bool = false, layer2: Bool = false, layer3: Bool = false,
+                layer4: Bool = false, layer5: Bool = false, layer6: Bool = false) {
+        self.layer1 = layer1
+        self.layer2 = layer2
+        self.layer3 = layer3
+        self.layer4 = layer4
+        self.layer5 = layer5
+        self.layer6 = layer6
+    }
+
+    public static let defaults = LayerLock()
+
+    /// 1-based accessor (1…6) for the layer lock flags.
+    public subscript(layer: Int) -> Bool {
+        get {
+            switch layer {
+            case 1: return layer1
+            case 2: return layer2
+            case 3: return layer3
+            case 4: return layer4
+            case 5: return layer5
+            case 6: return layer6
+            default: return false
+            }
+        }
+        set {
+            switch layer {
+            case 1: layer1 = newValue
+            case 2: layer2 = newValue
+            case 3: layer3 = newValue
+            case 4: layer4 = newValue
+            case 5: layer5 = newValue
+            case 6: layer6 = newValue
+            default: break
+            }
+        }
+    }
+}
+
 /// All layer-related settings, persisted as `layerSettings` on the project.
 public struct LayerSettings: Codable, Equatable {
     public var enabled: LayerVisibility
+    public var locked: LayerLock
     public var watermark: WatermarkSettings
     public var overlay: OverlaySettings
     /// User-added layers drawn between layer 4 and layer 3 (top of list = top).
     public var extraLayers: [ExtraLayer]
+    /// Extra-layer UUIDs whose lock is on (can't be selected/edited).
+    public var lockedExtraLayerIDs: Set<UUID>
     public var bg5: BackgroundSettings
     public var bg6: FinalBackground
     /// Layer-2 PSD styled text settings.
@@ -351,17 +403,21 @@ public struct LayerSettings: Codable, Equatable {
 
     public init(
         enabled: LayerVisibility = .defaults,
+        locked: LayerLock = .defaults,
         watermark: WatermarkSettings = .defaults,
         overlay: OverlaySettings = .defaults,
         extraLayers: [ExtraLayer] = [],
+        lockedExtraLayerIDs: Set<UUID> = [],
         bg5: BackgroundSettings = .defaults,
         bg6: FinalBackground = .defaults,
         psdText: PSDTextSettings = .defaults
     ) {
         self.enabled = enabled
+        self.locked = locked
         self.watermark = watermark
         self.overlay = overlay
         self.extraLayers = extraLayers
+        self.lockedExtraLayerIDs = lockedExtraLayerIDs
         self.bg5 = bg5
         self.bg6 = bg6
         self.psdText = psdText
@@ -369,18 +425,20 @@ public struct LayerSettings: Codable, Equatable {
 
     public static let defaults = LayerSettings()
 
-    // MARK: Codable (backward-compatible with pre-psdText projects)
+    // MARK: Codable (backward-compatible with pre-psdText / pre-lock projects)
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, watermark, overlay, extraLayers, bg5, bg6, psdText
+        case enabled, locked, watermark, overlay, extraLayers, lockedExtraLayerIDs, bg5, bg6, psdText
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent(LayerVisibility.self, forKey: .enabled) ?? .defaults
+        locked = try c.decodeIfPresent(LayerLock.self, forKey: .locked) ?? .defaults
         watermark = try c.decodeIfPresent(WatermarkSettings.self, forKey: .watermark) ?? .defaults
         overlay = try c.decodeIfPresent(OverlaySettings.self, forKey: .overlay) ?? .defaults
         extraLayers = try c.decodeIfPresent([ExtraLayer].self, forKey: .extraLayers) ?? []
+        lockedExtraLayerIDs = try c.decodeIfPresent(Set<UUID>.self, forKey: .lockedExtraLayerIDs) ?? []
         bg5 = try c.decodeIfPresent(BackgroundSettings.self, forKey: .bg5) ?? .defaults
         bg6 = try c.decodeIfPresent(FinalBackground.self, forKey: .bg6) ?? .defaults
         psdText = try c.decodeIfPresent(PSDTextSettings.self, forKey: .psdText) ?? .defaults
@@ -393,9 +451,11 @@ public struct LayerSettings: Codable, Equatable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(enabled, forKey: .enabled)
+        try c.encode(locked, forKey: .locked)
         try c.encode(watermark, forKey: .watermark)
         try c.encode(overlay, forKey: .overlay)
         try c.encode(extraLayers, forKey: .extraLayers)
+        try c.encode(lockedExtraLayerIDs, forKey: .lockedExtraLayerIDs)
         try c.encode(bg5, forKey: .bg5)
         try c.encode(bg6, forKey: .bg6)
         try c.encode(psdText, forKey: .psdText)

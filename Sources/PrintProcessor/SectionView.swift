@@ -1,28 +1,38 @@
 import AppKit
 import PrintProcessorCore
 
-/// A collapsible options section with an eye (on/off) toggle and a disclosure triangle.
+/// A collapsible options section with an eye (on/off) toggle, a lock toggle and
+/// a disclosure triangle.
 final class SectionView: NSView {
     let sectionTitle: String
 
     private(set) var isVisible = true
     private(set) var isExpanded = true
+    private(set) var isLocked = false
 
     /// Called after the eye toggle changes, with the new visibility state.
     var onEyeToggle: ((Bool) -> Void)?
+    /// Called after the lock toggle changes, with the new lock state.
+    var onLockToggle: ((Bool) -> Void)?
 
     private let headerView = NSView()
     private let disclosureButton = NSButton()
     private let eyeButton = NSButton()
+    private let lockButton = NSButton()
     private let titleLabel: NSTextField
     private let bodyView: NSView
     private let innerStack = NSStackView()
 
+    /// Whether the section shows a lock toggle (false for non-layer sections).
+    private let showsLock: Bool
+
     /// - Parameters:
     ///   - title: Section header text.
     ///   - bodyText: Placeholder description shown in the collapsed body.
-    init(title: String, bodyText: String) {
+    ///   - showsLock: Whether to show the lock toggle (default true).
+    init(title: String, bodyText: String, showsLock: Bool = true) {
         self.sectionTitle = title
+        self.showsLock = showsLock
         self.titleLabel = makeLabel(title, size: 13, weight: .semibold, color: .labelColor)
         self.bodyView = SectionView.makeBody(bodyText)
         super.init(frame: .zero)
@@ -32,8 +42,10 @@ final class SectionView: NSView {
     /// - Parameters:
     ///   - title: Section header text.
     ///   - body: Custom content view for the section body.
-    init(title: String, body: NSView) {
+    ///   - showsLock: Whether to show the lock toggle (default true).
+    init(title: String, body: NSView, showsLock: Bool = true) {
         self.sectionTitle = title
+        self.showsLock = showsLock
         self.titleLabel = makeLabel(title, size: 13, weight: .semibold, color: .labelColor)
         self.bodyView = body
         super.init(frame: .zero)
@@ -67,7 +79,7 @@ final class SectionView: NSView {
         layer?.borderWidth = 1
         layer?.cornerRadius = 4
 
-        // Header row: disclosure + eye + title.
+        // Header row: disclosure + eye + lock + title.
         headerView.translatesAutoresizingMaskIntoConstraints = false
         headerView.wantsLayer = true
         headerView.layer?.backgroundColor = NSColor.panel.cgColor
@@ -90,12 +102,23 @@ final class SectionView: NSView {
         eyeButton.translatesAutoresizingMaskIntoConstraints = false
         updateEyeIcon()
 
+        lockButton.setButtonType(.momentaryChange)
+        lockButton.isBordered = false
+        lockButton.imagePosition = .imageOnly
+        lockButton.imageScaling = .scaleProportionallyDown
+        lockButton.target = self
+        lockButton.action = #selector(toggleLocked)
+        lockButton.translatesAutoresizingMaskIntoConstraints = false
+        updateLockIcon()
+
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         headerView.addSubview(disclosureButton)
         headerView.addSubview(eyeButton)
+        if showsLock { headerView.addSubview(lockButton) }
         headerView.addSubview(titleLabel)
-        NSLayoutConstraint.activate([
+
+        var constraints: [NSLayoutConstraint] = [
             headerView.heightAnchor.constraint(equalToConstant: 30),
             disclosureButton.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 6),
             disclosureButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
@@ -104,10 +127,19 @@ final class SectionView: NSView {
             eyeButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             eyeButton.widthAnchor.constraint(equalToConstant: 22),
             eyeButton.heightAnchor.constraint(equalToConstant: 20),
-            titleLabel.leadingAnchor.constraint(equalTo: eyeButton.trailingAnchor, constant: 4),
             titleLabel.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: headerView.trailingAnchor, constant: -8),
-        ])
+        ]
+        if showsLock {
+            constraints.append(lockButton.leadingAnchor.constraint(equalTo: eyeButton.trailingAnchor, constant: 4))
+            constraints.append(lockButton.centerYAnchor.constraint(equalTo: headerView.centerYAnchor))
+            constraints.append(lockButton.widthAnchor.constraint(equalToConstant: 22))
+            constraints.append(lockButton.heightAnchor.constraint(equalToConstant: 20))
+            constraints.append(titleLabel.leadingAnchor.constraint(equalTo: lockButton.trailingAnchor, constant: 4))
+        } else {
+            constraints.append(titleLabel.leadingAnchor.constraint(equalTo: eyeButton.trailingAnchor, constant: 4))
+        }
+        NSLayoutConstraint.activate(constraints)
 
         // Body.
         bodyView.translatesAutoresizingMaskIntoConstraints = false
@@ -139,6 +171,13 @@ final class SectionView: NSView {
         bodyView.alphaValue = isVisible ? 1.0 : 0.45
     }
 
+    private func updateLockIcon() {
+        lockButton.image = symbol(isLocked ? "lock.fill" : "lock.open")
+        lockButton.toolTip = isLocked
+            ? "\(sectionTitle) — locked (click to unlock)"
+            : "\(sectionTitle) — unlocked (click to lock)"
+    }
+
     @objc private func toggleExpanded() {
         isExpanded = (disclosureButton.state == .on)
         bodyView.isHidden = !isExpanded
@@ -150,11 +189,38 @@ final class SectionView: NSView {
         onEyeToggle?(isVisible)
     }
 
+    @objc private func toggleLocked() {
+        isLocked.toggle()
+        updateLockIcon()
+        onLockToggle?(isLocked)
+    }
+
     /// Programmatically set the eye state without firing `onEyeToggle`.
     func setVisible(_ visible: Bool) {
         guard isVisible != visible else { return }
         isVisible = visible
         updateEyeIcon()
+    }
+
+    /// Programmatically set the lock state without firing `onLockToggle`.
+    func setLocked(_ locked: Bool) {
+        guard isLocked != locked else { return }
+        isLocked = locked
+        updateLockIcon()
+    }
+
+    /// Enable/disable the section body's controls (used by the layer lock).
+    func setBodyLocked(_ locked: Bool) {
+        setControlsEnabled(!locked, in: bodyView)
+    }
+
+    private func setControlsEnabled(_ enabled: Bool, in view: NSView) {
+        if let control = view as? NSControl {
+            control.isEnabled = enabled
+        }
+        for subview in view.subviews {
+            setControlsEnabled(enabled, in: subview)
+        }
     }
 
     /// Whether the window's first responder is this section or one of its controls.

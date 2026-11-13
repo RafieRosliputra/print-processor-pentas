@@ -80,6 +80,15 @@ final class CanvasView: NSView {
     }
     var psdTextAlign: TextAlign = .centre
 
+    // Lock state: numbered layers 1…6 and extra-layer UUIDs. A locked layer
+    // can't be selected or free-transformed on the canvas.
+    var lockedLayerNumbers: Set<Int> = [] {
+        didSet { deselectLockedSelection() }
+    }
+    var lockedExtraLayerIDs: Set<UUID> = [] {
+        didSet { deselectLockedSelection() }
+    }
+
     // MARK: - Callbacks
 
     /// Layer-4 edit produced by user input (`commit` = discrete/undoable).
@@ -672,10 +681,12 @@ final class CanvasView: NSView {
     override func mouseMoved(with event: NSEvent) {
         guard !locked else { hoveredLayer = nil; resetCursor(); return }
         let screenPoint = convert(event.locationInWindow, from: nil)
-        if let psdBox = psdTextBox,
+        if !lockedLayerNumbers.contains(2),
+           let psdBox = psdTextBox,
            quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
             hoveredLayer = 2
-        } else if overlayCorners().count == 4 && quadContains(screenQuad(overlayCorners()), screenPoint) {
+        } else if !lockedLayerNumbers.contains(3),
+                  overlayCorners().count == 4 && quadContains(screenQuad(overlayCorners()), screenPoint) {
             hoveredLayer = 3
         } else {
             hoveredLayer = nil
@@ -739,7 +750,25 @@ final class CanvasView: NSView {
     /// Select an extra layer on the canvas (shows the red box + handles).
     func selectExtraLayer(_ id: UUID) {
         guard !locked else { return }
+        guard !lockedExtraLayerIDs.contains(id) else { return }
         selection = .extraLayer(id)
+    }
+
+    /// Whether the given selection's layer is currently locked.
+    private func isLocked(_ sel: SelectedLayer) -> Bool {
+        switch sel {
+        case .watermark: return lockedLayerNumbers.contains(1)
+        case .psdText: return lockedLayerNumbers.contains(2)
+        case .overlay: return lockedLayerNumbers.contains(3)
+        case .extraLayer(let id): return lockedExtraLayerIDs.contains(id)
+        }
+    }
+
+    /// Drop the selection when its layer just became locked.
+    private func deselectLockedSelection() {
+        if let sel = selection, isLocked(sel) {
+            selection = nil
+        }
     }
 
     // MARK: - Mouse (selection + layer-4 pan)
@@ -783,14 +812,17 @@ final class CanvasView: NSView {
         }
 
         // 2. Select psd text box, overlay (above photo), or watermark when clicked.
-        if let psdBox = psdTextBox,
+        // Locked layers are skipped (they can't be selected for editing).
+        if !lockedLayerNumbers.contains(2),
+           let psdBox = psdTextBox,
            quadContains(screenQuad(rectCorners(psdBox.pixelRect(canvas: compositePixelSize))), screenPoint) {
             selection = .psdText
             beginTransform(.psdText, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
         }
         let overlayQ = overlayCorners()
-        if overlayQ.count == 4 && quadContains(screenQuad(overlayQ), screenPoint) {
+        if !lockedLayerNumbers.contains(3),
+           overlayQ.count == 4 && quadContains(screenQuad(overlayQ), screenPoint) {
             selection = .overlay
             beginTransform(.overlay, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
@@ -798,20 +830,23 @@ final class CanvasView: NSView {
         // Extra layers (below the overlay, above the photo); list order = top.
         for state in extraLayerStates {
             let q = extraLayerCorners(state)
-            if q.count == 4 && quadContains(screenQuad(q), screenPoint) {
+            if !lockedExtraLayerIDs.contains(state.id),
+               q.count == 4 && quadContains(screenQuad(q), screenPoint) {
                 selection = .extraLayer(state.id)
                 beginTransform(.extraLayer(state.id), mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
                 return
             }
         }
         let watermarkQ = watermarkCorners()
-        if watermarkQ.count == 4 && quadContains(screenQuad(watermarkQ), screenPoint) {
+        if !lockedLayerNumbers.contains(1),
+           watermarkQ.count == 4 && quadContains(screenQuad(watermarkQ), screenPoint) {
             selection = .watermark
             beginTransform(.watermark, mode: .move, start: canvas, option: event.modifierFlags.contains(.option))
             return
         }
 
-        // 3. Otherwise: layer-4 pan.
+        // 3. Otherwise: layer-4 pan (skipped when the photo layer is locked).
+        guard !lockedLayerNumbers.contains(4) else { return }
         lastDragPoint = screenPoint
         lastGestureScope = scope(for: event)
         beginGesture()
@@ -1237,6 +1272,7 @@ final class CanvasView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard !locked else { return }
+        guard !lockedLayerNumbers.contains(4) else { return }
         lastGestureScope = scope(for: event)
         beginGesture()
         if isRDown {
@@ -1364,6 +1400,7 @@ final class CanvasView: NSView {
     }
 
     private func nudge(dx: Double, dy: Double, scope: GlobalEditScope) {
+        guard !lockedLayerNumbers.contains(4) else { return }
         beginGesture()
         var e = edit
         if settings.nudgeBasis == .screen {
